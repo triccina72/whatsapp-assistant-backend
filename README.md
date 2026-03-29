@@ -1,5 +1,6 @@
 # WhatsApp Assistant Backend
 
+
 Backend per l'assistente personale su WhatsApp. Gestisce la memoria oggetti (salva e recupera dove hai messo le cose).
 
 ## Endpoints
