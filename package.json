@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp-assistant-backend",
+  "version": "1.0.0",
+  "description": "Backend per assistente personale WhatsApp",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3"
+  }
+}
