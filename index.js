@@ -48,17 +48,14 @@ app.get('/', (req, res) => {
 
 app.post('/memory/save', async (req, res) => {
   const { user_id, object_name, location } = req.body;
-
   if (!user_id || !object_name || !location) {
-    return res.status(400).json({ error: 'Parametri mancanti: user_id, object_name, location' });
+    return res.status(400).json({ error: 'Parametri mancanti' });
   }
-
   try {
     const existing = await pool.query(
       'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
       [user_id, object_name]
     );
-
     if (existing.rows.length > 0) {
       await pool.query(
         'UPDATE memories SET location = $1, updated_at = NOW() WHERE user_id = $2 AND LOWER(object_name) = LOWER($3)',
@@ -80,20 +77,17 @@ app.post('/memory/save', async (req, res) => {
 
 app.post('/memory/find', async (req, res) => {
   const { user_id, object_name } = req.body;
-
   if (!user_id || !object_name) {
-    return res.status(400).json({ error: 'Parametri mancanti: user_id, object_name' });
+    return res.status(400).json({ error: 'Parametri mancanti' });
   }
-
   try {
     const result = await pool.query(
       'SELECT object_name, location, updated_at FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
       [user_id, object_name]
     );
-
     if (result.rows.length > 0) {
       const row = result.rows[0];
-      return res.json({ found: true, object_name: row.object_name, location: row.location, updated_at: row.updated_at });
+      return res.json({ found: true, object_name: row.object_name, location: row.location });
     } else {
       return res.json({ found: false, object_name });
     }
@@ -105,11 +99,9 @@ app.post('/memory/find', async (req, res) => {
 
 app.get('/memory/list', async (req, res) => {
   const { user_id } = req.query;
-
   if (!user_id) {
     return res.status(400).json({ error: 'Parametro mancante: user_id' });
   }
-
   try {
     const result = await pool.query(
       'SELECT object_name, location, updated_at FROM memories WHERE user_id = $1 ORDER BY updated_at DESC',
@@ -124,11 +116,9 @@ app.get('/memory/list', async (req, res) => {
 
 app.post('/reminder/save', async (req, res) => {
   const { user_id, conversation_id, message, remind_at, channel, recurrence } = req.body;
-
   if (!user_id || !message || !remind_at) {
     return res.status(400).json({ error: 'Parametri mancanti: user_id, message, remind_at' });
   }
-
   try {
     await pool.query(
       'INSERT INTO reminders (user_id, conversation_id, message, remind_at, channel, recurrence) VALUES ($1, $2, $3, $4, $5, $6)',
