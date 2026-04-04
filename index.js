@@ -2,6 +2,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
 
 const app = express();
 app.use(express.json());
@@ -229,6 +231,39 @@ async function executeTool(toolName, toolInput, userId) {
     return { files: result.data.files };
   }
 
+  if (toolName === 'search_gmail_orders') {
+    const client = new ImapFlow({
+      host: 'imap.gmail.com',
+      port: 993,
+      secure: true,
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD
+      },
+      logger: false
+    });
+    await client.connect();
+    const results = [];
+    try {
+      await client.mailboxOpen('Ordini Tessuti');
+      const messages = await client.search({ text: toolInput.query });
+      const limit = Math.min(messages.length, toolInput.max_results || 5);
+      const toFetch = messages.slice(-limit);
+      for await (const msg of client.fetch(toFetch, { source: true })) {
+        const parsed = await simpleParser(msg.source);
+        results.push({
+          subject: parsed.subject,
+          from: parsed.from?.text,
+          date: parsed.date,
+          text: parsed.text?.substring(0, 500)
+        });
+      }
+    } finally {
+      await client.logout();
+    }
+    return { emails: results };
+  }
+
   return { error: 'Tool non trovato' };
 }
 
@@ -260,23 +295,13 @@ app.post('/chat', async (req, res) => {
     }));
     conversationHistory.push({ role: 'user', content: message });
 
-       const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
+    const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
 Parli sempre in italiano, sei amichevole, diretta e pratica.
 Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
 
 OGGETTI IN MEMORIA:
 ${memoryText}
 
-REGOLE:
-- Rispondi sempre in italiano
-- Sii concisa e diretta
-- Usa i tool quando necessario senza chiedere conferma
-- Non mostrare mai JSON o dati tecnici all'utente
-- Se l'utente dice dove mette qualcosa, salvalo subito con save_object
-- Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar
-- Se non hai un tool per eseguire un'azione, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
-- NON dire mai "fatto" o "ho eseguito" se non hai usato un tool
-- Sii sempre onesta su cosa puoi e non puoi fare
 REGOLE DI COMPORTAMENTO:
 - Parla sempre in italiano, in modo caldo e diretto come un'amica fidata
 - Sii proattiva: se vedi qualcosa di utile, suggeriscilo
@@ -286,8 +311,9 @@ REGOLE DI COMPORTAMENTO:
 REGOLE OPERATIVE:
 - NON dire mai "fatto" senza aver verificato l'esito dell'azione
 - Se qualcosa non va, dillo subito con onestà
-- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE
-- Non mostrare mai JSON o dati tecnici
+- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
+- Non mostrare mai JSON o dati tecnici all'utente
+- Sii sempre onesta su cosa puoi e non puoi fare
 
 MEMORIA OGGETTI:
 - Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object
@@ -302,6 +328,7 @@ PRODUZIONE E ORDINI:
 - Estrai sempre: Cliente, Ordine, Modello, Note
 - Organizza per cliente su Drive
 - Se richiesto, mostra il file direttamente in chat
+- Per cercare ordini tessuti usa search_gmail_orders
 
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
