@@ -159,7 +159,7 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'create_calendar_event') {
-    console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
+    console.log('Creazione evento:', JSON.stringify(toolInput));
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const startTime = new Date(toolInput.date_time);
@@ -174,15 +174,19 @@ async function executeTool(toolName, toolInput, userId) {
       }
     });
     console.log('Evento creato:', event.data.id);
-    return { success: true, event_id: event.data.id, link: event.data.htmlLink };
+    return { success: true, event_id: event.data.id };
   }
 
   if (toolName === 'delete_calendar_event') {
     console.log('Eliminazione evento:', JSON.stringify(toolInput));
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
-    const timeMin = toolInput.date ? new Date(toolInput.date + 'T00:00:00').toISOString() : new Date().toISOString();
-    const timeMax = toolInput.date ? new Date(toolInput.date + 'T23:59:59').toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const timeMin = toolInput.date
+      ? new Date(toolInput.date + 'T00:00:00').toISOString()
+      : new Date().toISOString();
+    const timeMax = toolInput.date
+      ? new Date(toolInput.date + 'T23:59:59').toISOString()
+      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     const events = await calendar.events.list({
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
       timeMin,
@@ -198,6 +202,7 @@ async function executeTool(toolName, toolInput, userId) {
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
       eventId: eventToDelete.id
     });
+    console.log('Evento eliminato:', eventToDelete.summary);
     return { success: true, message: `Evento "${eventToDelete.summary}" eliminato` };
   }
 
@@ -259,7 +264,36 @@ REGOLE:
 - Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar
 - Se non hai un tool per eseguire un'azione, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
 - NON dire mai "fatto" o "ho eseguito" se non hai usato un tool
-- Sii sempre onesta su cosa puoi e non puoi fare`;
+- Sii sempre onesta su cosa puoi e non puoi fare
+REGOLE DI COMPORTAMENTO:
+- Parla sempre in italiano, in modo caldo e diretto come un'amica fidata
+- Sii proattiva: se vedi qualcosa di utile, suggeriscilo
+- Rispetta il tempo di Simona: sii sintetica quando serve
+- Salva subito qualsiasi informazione importante che Simona ti dice
+
+REGOLE OPERATIVE:
+- NON dire mai "fatto" senza aver verificato l'esito dell'azione
+- Se qualcosa non va, dillo subito con onestà
+- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE
+- Non mostrare mai JSON o dati tecnici
+
+MEMORIA OGGETTI:
+- Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object
+
+DOCUMENTI MEDICI:
+- Quando ricevi un PDF medico, analizzalo e fai un riassunto
+- Rinominalo: [Tipo documento]-Ricci Simona-DATA.pdf
+- Controlla sempre se esiste già prima di salvarlo
+- Archivia in cartella Drive dedicata
+
+PRODUZIONE E ORDINI:
+- Estrai sempre: Cliente, Ordine, Modello, Note
+- Organizza per cliente su Drive
+- Se richiesto, mostra il file direttamente in chat
+
+CALENDARIO:
+- Se Simona chiede di creare un evento, crealo subito su Calendar
+- Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;
 
     let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -272,18 +306,21 @@ REGOLE:
     const toolMessages = [...conversationHistory];
 
     while (response.stop_reason === 'tool_use') {
-      const toolUseBlock = response.content.find(b => b.type === 'tool_use');
-      const toolResult = await executeTool(toolUseBlock.name, toolUseBlock.input, user_id);
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (block) => {
+          const result = await executeTool(block.name, block.input, user_id);
+          return {
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: JSON.stringify(result)
+          };
+        })
+      );
 
       toolMessages.push({ role: 'assistant', content: response.content });
-      toolMessages.push({
-        role: 'user',
-        content: [{
-          type: 'tool_result',
-          tool_use_id: toolUseBlock.id,
-          content: JSON.stringify(toolResult)
-        }]
-      });
+      toolMessages.push({ role: 'user', content: toolResults });
 
       response = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
