@@ -96,7 +96,7 @@ const tools = [
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Titolo evento' },
-        date_time: { type: 'string', description: 'Data e ora ISO 8601 es: 2026-04-05T15:30:00' },
+        date_time: { type: 'string', description: 'Data e ora ISO 8601 SENZA fuso orario es: 2026-04-05T15:30:00' },
         duration_minutes: { type: 'number', description: 'Durata in minuti, default 60' },
         description: { type: 'string', description: 'Descrizione evento' }
       },
@@ -176,22 +176,27 @@ async function executeTool(toolName, toolInput, userId) {
     console.log('Creazione evento:', JSON.stringify(toolInput));
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
-    
-    const dateTimeWithTZ = toolInput.date_time + '+02:00';
-    const startTime = new Date(dateTimeWithTZ);
-    const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
-    
-    const formatDateTime = (date) => {
-      return date.toISOString().replace('Z', '+02:00');
-    };
+
+    const dt = toolInput.date_time.replace(/[+Z].*$/, '');
+    const durationMs = (toolInput.duration_minutes || 60) * 60000;
+    const startParts = dt.match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+    const endDate = new Date(Date.UTC(
+      parseInt(startParts[1]),
+      parseInt(startParts[2]) - 1,
+      parseInt(startParts[3]),
+      parseInt(startParts[4]),
+      parseInt(startParts[5]),
+      parseInt(startParts[6])
+    ) + durationMs);
+    const endDt = endDate.toISOString().replace('Z', '').substring(0, 19);
 
     const event = await calendar.events.insert({
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
       requestBody: {
         summary: toolInput.title,
         description: toolInput.description || '',
-        start: { dateTime: formatDateTime(startTime), timeZone: 'Europe/Rome' },
-        end: { dateTime: formatDateTime(endTime), timeZone: 'Europe/Rome' }
+        start: { dateTime: dt, timeZone: 'Europe/Rome' },
+        end: { dateTime: endDt, timeZone: 'Europe/Rome' }
       }
     });
     console.log('Evento creato:', event.data.id);
@@ -203,10 +208,10 @@ async function executeTool(toolName, toolInput, userId) {
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const timeMin = toolInput.date
-      ? new Date(toolInput.date + 'T00:00:00+02:00').toISOString()
+      ? new Date(toolInput.date + 'T00:00:00').toISOString()
       : new Date().toISOString();
     const timeMax = toolInput.date
-      ? new Date(toolInput.date + 'T23:59:59+02:00').toISOString()
+      ? new Date(toolInput.date + 'T23:59:59').toISOString()
       : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     const events = await calendar.events.list({
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
@@ -305,7 +310,7 @@ app.post('/chat', async (req, res) => {
     const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
 Parli sempre in italiano, sei amichevole, diretta e pratica.
 Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
-FUSO ORARIO: Europe/Rome (UTC+2). Quando crei eventi usa SEMPRE l'orario esatto che ti dice Simona senza modificarlo.
+FUSO ORARIO: Europe/Rome. Usa SEMPRE l'orario esatto che ti dice Simona nel formato YYYY-MM-DDTHH:MM:SS senza aggiungere fuso orario.
 
 OGGETTI IN MEMORIA:
 ${memoryText}
@@ -335,12 +340,12 @@ DOCUMENTI MEDICI:
 PRODUZIONE E ORDINI:
 - Estrai sempre: Cliente, Ordine, Modello, Note
 - Organizza per cliente su Drive
-- Se richiesto, mostra il file direttamente in chat
 - Per cercare ordini tessuti usa search_gmail_orders
 
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
-- Usa SEMPRE l'orario esatto che ti dice Simona — il sistema gestisce il fuso orario automaticamente
+- Usa SEMPRE l'orario esatto che ti dice Simona nel formato 2026-04-05T15:30:00
+- NON aggiungere mai offset di fuso orario alla data
 - Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;
 
     let response = await anthropic.messages.create({
