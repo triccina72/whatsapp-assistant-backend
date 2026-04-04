@@ -1,5 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
+const { google } = require('googleapis');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(express.json());
@@ -8,6 +10,21 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+function getGoogleAuth() {
+  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+  return new google.auth.JWT(
+    credentials.client_email,
+    null,
+    credentials.private_key,
+    [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/drive'
+    ]
+  );
+}
 
 async function initDB() {
   await pool.query(`
@@ -19,10 +36,6 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  console.log('Database pronto.');
-}
-
-async function initRemindersDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reminders (
       id SERIAL PRIMARY KEY,
@@ -36,14 +49,13 @@ async function initRemindersDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  console.log('Tabella reminders pronta.');
+  console.log('Database pronto.');
 }
 
 initDB().catch(console.error);
-initRemindersDB().catch(console.error);
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Backend assistente attivo' });
+  res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
 });
 
 app.post('/memory/save', async (req, res) => {
@@ -117,7 +129,7 @@ app.get('/memory/list', async (req, res) => {
 app.post('/reminder/save', async (req, res) => {
   const { user_id, conversation_id, message, remind_at, channel, recurrence } = req.body;
   if (!user_id || !message || !remind_at) {
-    return res.status(400).json({ error: 'Parametri mancanti: user_id, message, remind_at' });
+    return res.status(400).json({ error: 'Parametri mancanti' });
   }
   try {
     await pool.query(
@@ -130,8 +142,52 @@ app.post('/reminder/save', async (req, res) => {
     res.status(500).json({ error: 'Errore database' });
   }
 });
-const Anthropic = require('@anthropic-ai/sdk');
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+app.post('/calendar/create', async (req, res) => {
+  const { title, date_time, duration_minutes, description } = req.body;
+  if (!title || !date_time) {
+    return res.status(400).json({ error: 'Parametri mancanti: title, date_time' });
+  }
+  try {
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const startTime = new Date(date_time);
+    const endTime = new Date(startTime.getTime() + (duration_minutes || 60) * 60000);
+    const event = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary: title,
+        description: description || '',
+        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
+        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+      }
+    });
+    return res.json({ success: true, event_id: event.data.id, link: event.data.htmlLink });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore Calendar: ' + err.message });
+  }
+});
+
+app.post('/drive/search', async (req, res) => {
+  const { query } = req.body;
+  if (!query) {
+    return res.status(400).json({ error: 'Parametro mancante: query' });
+  }
+  try {
+    const auth = getGoogleAuth();
+    const drive = google.drive({ version: 'v3', auth });
+    const result = await drive.files.list({
+      q: `name contains '${query}' and trashed = false`,
+      fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
+      pageSize: 10
+    });
+    return res.json({ files: result.data.files });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore Drive: ' + err.message });
+  }
+});
 
 app.post('/chat', async (req, res) => {
   const { user_id, message } = req.body;
@@ -150,9 +206,24 @@ app.post('/chat', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1000,
-      system: `Sei Simona AI, assistente personale di Simona. 
-Parli sempre in italiano, sei amichevole e diretta.
-Oggetti salvati in memoria:\n${memoryText}`,
+      system: `Sei Simona AI, assistente personale di Simona Tricci.
+Parli sempre in italiano, sei amichevole, diretta e pratica.
+Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
+
+COSA SAI FARE:
+- Ricordare dove sono gli oggetti (memoria persistente)
+- Creare eventi e reminder su Google Calendar
+- Cercare documenti su Google Drive
+- Rispondere a domande generali
+
+OGGETTI IN MEMORIA:
+${memoryText}
+
+REGOLE:
+- Rispondi sempre in italiano
+- Sii concisa e diretta
+- Se l'utente vuole creare un reminder o evento, chiedi conferma dei dettagli (data, ora, descrizione)
+- Se l'utente dice dove mette qualcosa, confermalo e ricordaglielo`,
       messages: [{ role: 'user', content: message }]
     });
 
@@ -162,7 +233,8 @@ Oggetti salvati in memoria:\n${memoryText}`,
     res.status(500).json({ error: 'Errore Claude API' });
   }
 });
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server avviato sulla porta ${PORT}`);
+  console.log(`Server Simona AI avviato sulla porta ${PORT}`);
 });
