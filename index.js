@@ -184,7 +184,7 @@ async function executeTool(toolName, toolInput, userId) {
         summary: toolInput.title,
         description: toolInput.description || '',
         start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
-        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
       }
     });
     console.log('Evento creato:', event.data.id);
