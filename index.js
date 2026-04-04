@@ -63,8 +63,212 @@ async function initDB() {
 
 initDB().catch(console.error);
 
+const tools = [
+  {
+    name: 'save_object',
+    description: 'Salva la posizione di un oggetto nella memoria persistente',
+    input_schema: {
+      type: 'object',
+      properties: {
+        object_name: { type: 'string', description: 'Nome oggetto' },
+        location: { type: 'string', description: 'Dove si trova' }
+      },
+      required: ['object_name', 'location']
+    }
+  },
+  {
+    name: 'find_object',
+    description: 'Cerca la posizione di un oggetto nella memoria',
+    input_schema: {
+      type: 'object',
+      properties: {
+        object_name: { type: 'string', description: 'Nome oggetto da cercare' }
+      },
+      required: ['object_name']
+    }
+  },
+  {
+    name: 'create_calendar_event',
+    description: 'Crea un evento su Google Calendar',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Titolo evento' },
+        date_time: { type: 'string', description: 'Data e ora in formato ISO 8601 es: 2026-04-05T15:30:00' },
+        duration_minutes: { type: 'number', description: 'Durata in minuti, default 60' },
+        description: { type: 'string', description: 'Descrizione evento' }
+      },
+      required: ['title', 'date_time']
+    }
+  },
+  {
+    name: 'search_drive',
+    description: 'Cerca file e documenti su Google Drive',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Termine di ricerca' }
+      },
+      required: ['query']
+    }
+  }
+];
+
+async function executeTool(toolName, toolInput, userId) {
+  if (toolName === 'save_object') {
+    const existing = await pool.query(
+      'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
+      [userId, toolInput.object_name]
+    );
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'UPDATE memories SET location = $1, updated_at = NOW() WHERE user_id = $2 AND LOWER(object_name) = LOWER($3)',
+        [toolInput.location, userId, toolInput.object_name]
+      );
+      return { success: true, action: 'updated', object_name: toolInput.object_name, location: toolInput.location };
+    } else {
+      await pool.query(
+        'INSERT INTO memories (user_id, object_name, location) VALUES ($1, $2, $3)',
+        [userId, toolInput.object_name, toolInput.location]
+      );
+      return { success: true, action: 'saved', object_name: toolInput.object_name, location: toolInput.location };
+    }
+  }
+
+  if (toolName === 'find_object') {
+    const result = await pool.query(
+      'SELECT object_name, location FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
+      [userId, toolInput.object_name]
+    );
+    if (result.rows.length > 0) {
+      return { found: true, object_name: result.rows[0].object_name, location: result.rows[0].location };
+    }
+    return { found: false, object_name: toolInput.object_name };
+  }
+
+  if (toolName === 'create_calendar_event') {
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const startTime = new Date(toolInput.date_time);
+    const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
+    const event = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary: toolInput.title,
+        description: toolInput.description || '',
+        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
+        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+      }
+    });
+    return { success: true, event_id: event.data.id, link: event.data.htmlLink };
+  }
+
+  if (toolName === 'search_drive') {
+    const auth = getGoogleAuth();
+    const drive = google.drive({ version: 'v3', auth });
+    const result = await drive.files.list({
+      q: `name contains '${toolInput.query}' and trashed = false`,
+      fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
+      pageSize: 10
+    });
+    return { files: result.data.files };
+  }
+
+  return { error: 'Tool non trovato' };
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
+});
+
+app.post('/chat', async (req, res) => {
+  const { user_id, message } = req.body;
+  if (!user_id || !message) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    const memories = await pool.query(
+      'SELECT object_name, location FROM memories WHERE user_id = $1',
+      [user_id]
+    );
+    const memoryText = memories.rows.length > 0
+      ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
+      : 'Nessun oggetto salvato.';
+
+    const history = await pool.query(
+      'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+      [user_id]
+    );
+    const conversationHistory = history.rows.reverse().map(r => ({
+      role: r.role,
+      content: r.content
+    }));
+    conversationHistory.push({ role: 'user', content: message });
+
+    const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
+Parli sempre in italiano, sei amichevole, diretta e pratica.
+Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
+
+OGGETTI IN MEMORIA:
+${memoryText}
+
+REGOLE:
+- Rispondi sempre in italiano
+- Sii concisa e diretta
+- Usa i tool quando necessario senza chiedere conferma
+- Non mostrare mai JSON o dati tecnici all'utente
+- Se l'utente dice dove mette qualcosa, salvalo subito con save_object
+- Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar`;
+
+    let response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools: tools,
+      messages: conversationHistory
+    });
+
+    const toolMessages = [...conversationHistory];
+
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlock = response.content.find(b => b.type === 'tool_use');
+      const toolResult = await executeTool(toolUseBlock.name, toolUseBlock.input, user_id);
+
+      toolMessages.push({ role: 'assistant', content: response.content });
+      toolMessages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult)
+        }]
+      });
+
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: tools,
+        messages: toolMessages
+      });
+    }
+
+    const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
+
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'user', message]
+    );
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'assistant', reply]
+    );
+
+    return res.json({ reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore Claude API: ' + err.message });
+  }
 });
 
 app.post('/memory/save', async (req, res) => {
@@ -103,15 +307,13 @@ app.post('/memory/find', async (req, res) => {
   }
   try {
     const result = await pool.query(
-      'SELECT object_name, location, updated_at FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
+      'SELECT object_name, location FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
       [user_id, object_name]
     );
     if (result.rows.length > 0) {
-      const row = result.rows[0];
-      return res.json({ found: true, object_name: row.object_name, location: row.location });
-    } else {
-      return res.json({ found: false, object_name });
+      return res.json({ found: true, object_name: result.rows[0].object_name, location: result.rows[0].location });
     }
+    return res.json({ found: false, object_name });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Errore database' });
@@ -149,119 +351,6 @@ app.post('/reminder/save', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Errore database' });
-  }
-});
-
-app.post('/calendar/create', async (req, res) => {
-  const { title, date_time, duration_minutes, description } = req.body;
-  if (!title || !date_time) {
-    return res.status(400).json({ error: 'Parametri mancanti: title, date_time' });
-  }
-  try {
-    const auth = getGoogleAuth();
-    const calendar = google.calendar({ version: 'v3', auth });
-    const startTime = new Date(date_time);
-    const endTime = new Date(startTime.getTime() + (duration_minutes || 60) * 60000);
-    const event = await calendar.events.insert({
-      calendarId: 'primary',
-      requestBody: {
-        summary: title,
-        description: description || '',
-        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
-        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
-      }
-    });
-    return res.json({ success: true, event_id: event.data.id, link: event.data.htmlLink });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Errore Calendar: ' + err.message });
-  }
-});
-
-app.post('/drive/search', async (req, res) => {
-  const { query } = req.body;
-  if (!query) {
-    return res.status(400).json({ error: 'Parametro mancante: query' });
-  }
-  try {
-    const auth = getGoogleAuth();
-    const drive = google.drive({ version: 'v3', auth });
-    const result = await drive.files.list({
-      q: `name contains '${query}' and trashed = false`,
-      fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
-      pageSize: 10
-    });
-    return res.json({ files: result.data.files });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Errore Drive: ' + err.message });
-  }
-});
-
-app.post('/chat', async (req, res) => {
-  const { user_id, message } = req.body;
-  if (!user_id || !message) {
-    return res.status(400).json({ error: 'Parametri mancanti' });
-  }
-  try {
-    const memories = await pool.query(
-      'SELECT object_name, location FROM memories WHERE user_id = $1',
-      [user_id]
-    );
-    const memoryText = memories.rows.length > 0
-      ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
-      : 'Nessun oggetto salvato.';
-
-    const history = await pool.query(
-      'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
-      [user_id]
-    );
-    const conversationHistory = history.rows.reverse().map(r => ({
-      role: r.role,
-      content: r.content
-    }));
-
-    conversationHistory.push({ role: 'user', content: message });
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      system: `Sei Simona AI, assistente personale di Simona Tricci.
-Parli sempre in italiano, sei amichevole, diretta e pratica.
-Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
-
-COSA SAI FARE:
-- Ricordare dove sono gli oggetti (memoria persistente)
-- Creare eventi su Google Calendar chiamando: POST https://whatsapp-assistant-backend-production.up.railway.app/calendar/create con { title, date_time (ISO 8601), duration_minutes, description }
-- Cercare documenti su Google Drive chiamando: POST https://whatsapp-assistant-backend-production.up.railway.app/drive/search con { query }
-- Rispondere a domande generali
-
-OGGETTI IN MEMORIA:
-${memoryText}
-
-REGOLE:
-- Rispondi sempre in italiano
-- Sii concisa e diretta
-- Se l'utente conferma un evento, crealo SUBITO su Calendar
-- Se l'utente dice dove mette qualcosa, confermalo`,
-      messages: conversationHistory
-    });
-
-    const reply = response.content[0].text;
-
-    await pool.query(
-      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-      [user_id, 'user', message]
-    );
-    await pool.query(
-      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-      [user_id, 'assistant', reply]
-    );
-
-    return res.json({ reply });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Errore Claude API' });
   }
 });
 
