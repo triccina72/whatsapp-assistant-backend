@@ -325,19 +325,49 @@ async function executeTool(toolName, toolInput, userId) {
       const limit = Math.min(messages.length, toolInput.max_results || 5);
       const toFetch = messages.slice(-limit);
       for await (const msg of client.fetch(toFetch, { source: true })) {
-        const parsed = await simpleParser(msg.source);
-        results.push({
-          subject: parsed.subject,
-          from: parsed.from?.text,
-          date: parsed.date,
-          text: parsed.text?.substring(0, 500)
+  const parsed = await simpleParser(msg.source);
+  const emailData = {
+    subject: parsed.subject,
+    from: parsed.from?.text,
+    date: parsed.date,
+    text: parsed.text?.substring(0, 500),
+    attachments: []
+  };
+
+  if (parsed.attachments && parsed.attachments.length > 0) {
+    for (const attachment of parsed.attachments) {
+      if (attachment.contentType === 'application/pdf') {
+        const pdfBase64 = attachment.content.toString('base64');
+        const pdfResponse = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1024,
+          messages: [{
+            role: 'user',
+            content: [
+              {
+                type: 'document',
+                source: {
+                  type: 'base64',
+                  media_type: 'application/pdf',
+                  data: pdfBase64
+                }
+              },
+              {
+                type: 'text',
+                text: 'Estrai tutte le informazioni importanti da questo documento: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
+              }
+            ]
+          }]
+        });
+        emailData.attachments.push({
+          filename: attachment.filename,
+          content: pdfResponse.content[0].text
         });
       }
-    } finally {
-      await client.logout();
     }
-    return { emails: results };
   }
+  results.push(emailData);
+}
 
   return { error: 'Tool non trovato' };
 }
