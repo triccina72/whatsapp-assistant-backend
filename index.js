@@ -130,7 +130,38 @@ app.post('/reminder/save', async (req, res) => {
     res.status(500).json({ error: 'Errore database' });
   }
 });
+const Anthropic = require('@anthropic-ai/sdk');
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+app.post('/chat', async (req, res) => {
+  const { user_id, message } = req.body;
+  if (!user_id || !message) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    const memories = await pool.query(
+      'SELECT object_name, location FROM memories WHERE user_id = $1',
+      [user_id]
+    );
+    const memoryText = memories.rows.length > 0
+      ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
+      : 'Nessun oggetto salvato.';
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: `Sei Simona AI, assistente personale di Simona. 
+Parli sempre in italiano, sei amichevole e diretta.
+Oggetti salvati in memoria:\n${memoryText}`,
+      messages: [{ role: 'user', content: message }]
+    });
+
+    return res.json({ reply: response.content[0].text });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore Claude API' });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server avviato sulla porta ${PORT}`);
