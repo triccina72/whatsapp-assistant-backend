@@ -145,7 +145,9 @@ async function executeTool(toolName, toolInput, userId) {
     }
     return { found: false, object_name: toolInput.object_name };
   }
-
+  if (toolName === 'create_calendar_event') {
+  console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
+  const auth = getGoogleAuth();
   if (toolName === 'create_calendar_event') {
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
