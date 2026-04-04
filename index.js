@@ -102,6 +102,18 @@ const tools = [
     }
   },
   {
+    name: 'delete_calendar_event',
+    description: 'Elimina un evento da Google Calendar cercandolo per titolo',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Titolo evento da eliminare' },
+        date: { type: 'string', description: 'Data evento in formato YYYY-MM-DD' }
+      },
+      required: ['title']
+    }
+  },
+  {
     name: 'search_drive',
     description: 'Cerca file e documenti su Google Drive',
     input_schema: {
@@ -147,23 +159,46 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'create_calendar_event') {
-  console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
-  console.log('Auth email:', process.env.GOOGLE_SERVICE_ACCOUNT_KEY ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY).client_email : 'non trovata');
-  const auth = getGoogleAuth();
-  const calendar = google.calendar({ version: 'v3', auth });
-  const startTime = new Date(toolInput.date_time);
-  const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
-  const event = await calendar.events.insert({
-    calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
-    requestBody: {
-      summary: toolInput.title,
-      description: toolInput.description || '',
-      start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
-      end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+    console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const startTime = new Date(toolInput.date_time);
+    const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
+    const event = await calendar.events.insert({
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      requestBody: {
+        summary: toolInput.title,
+        description: toolInput.description || '',
+        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
+        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+      }
+    });
+    console.log('Evento creato:', event.data.id);
+    return { success: true, event_id: event.data.id, link: event.data.htmlLink };
+  }
+
+  if (toolName === 'delete_calendar_event') {
+    console.log('Eliminazione evento:', JSON.stringify(toolInput));
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const timeMin = toolInput.date ? new Date(toolInput.date + 'T00:00:00').toISOString() : new Date().toISOString();
+    const timeMax = toolInput.date ? new Date(toolInput.date + 'T23:59:59').toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const events = await calendar.events.list({
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      timeMin,
+      timeMax,
+      q: toolInput.title,
+      singleEvents: true
+    });
+    if (!events.data.items || events.data.items.length === 0) {
+      return { success: false, message: 'Evento non trovato' };
     }
-  });
-  console.log('Evento creato:', JSON.stringify(event.data));
-  return { success: true, event_id: event.data.id, link: event.data.htmlLink };
+    const eventToDelete = events.data.items[0];
+    await calendar.events.delete({
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      eventId: eventToDelete.id
+    });
+    return { success: true, message: `Evento "${eventToDelete.summary}" eliminato` };
   }
 
   if (toolName === 'search_drive') {
@@ -224,8 +259,8 @@ REGOLE:
 - Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar
 - Se non hai un tool per eseguire un'azione, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
 - NON dire mai "fatto" o "ho eseguito" se non hai usato un tool
-- Sii sempre onesta su cosa puoi e non puoi fare ;
-    
+- Sii sempre onesta su cosa puoi e non puoi fare`;
+
     let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
