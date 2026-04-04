@@ -260,5 +260,191 @@ app.post('/chat', async (req, res) => {
     }));
     conversationHistory.push({ role: 'user', content: message });
 
-    const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.\nParli sempre in italiano, sei amichevole, diretta e pratica.\nData e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}\n\nOGGETTI IN MEMORIA:\n${memoryText}\n\nREGOLE:\n- Rispondi sempre in italiano\n- Sii concisa e diretta\n- Usa i tool quando necessario senza chiedere conferma\n- Non mostrare mai JSON o dati tecnici all'utente\n- Se l'utente dice dove mette qualcosa, salvalo subito con save_object\n- Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar\n- Se non hai un tool per eseguire un'azione, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"\n- NON dire mai "fatto" o "ho eseguito" se non hai usato un tool\n- Sii sempre onesta su cosa puoi e non puoi fare\nREGOLE DI COMPORTAMENTO:\n- Parla sempre in italiano, in modo caldo e diretto come un'amica fidata\n- Sii proattiva: se vedi qualcosa di utile, suggeriscilo\n- Rispetta il tempo di Simona: sii sintetica quando serve\n- Salva subito qualsiasi informazione importante che Simona ti dice\n\nREGOLE OPERATIVE:\n- NON dire mai "fatto" senza aver verificato l'esito dell'azione\n- Se qualcosa non va, dillo subito con onestà\n- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE\n- Non mostrare mai JSON o dati tecnici\n\nMEMORIA OGGETTI:\n- Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object\n\nDOCUMENTI MEDICI:\n- Quando ricevi un PDF medico, analizzalo e fai un riassunto\n- Rinominalo: [Tipo documento]-Ricci Simona-DATA.pdf\n- Controlla sempre se esiste già prima di salvarlo\n- Archivia in cartella Drive dedicata\n\nPRODUZIONE E ORDINI:\n- Estrai sempre: Cliente, Ordine, Modello, Note\n- Organizza per cliente su Drive\n- Se richiesto, mostra il file direttamente in chat\n\nCALENDARIO:\n- Se Simona chiede di creare un evento, crealo subito su Calendar\n- Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;\n
-    let response = await anthropic.messages.create({\n      model: 'claude-sonnet-4-20250514',\n      max_tokens: 1024,\n      system: systemPrompt,\n      tools: tools,\n      messages: conversationHistory\n    });\n\n    const toolMessages = [...conversationHistory];\n\n    while (response.stop_reason === 'tool_use') {\n      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');\n\n      const toolResults = await Promise.all(\n        toolUseBlocks.map(async (block) => {\n          const result = await executeTool(block.name, block.input, user_id);\n          return {\n            type: 'tool_result',\n            tool_use_id: block.id,\n            content: JSON.stringify(result)\n          };\n        })\n      );\n\n      toolMessages.push({ role: 'assistant', content: response.content });\n      toolMessages.push({ role: 'user', content: toolResults });\n\n      response = await anthropic.messages.create({\n        model: 'claude-sonnet-4-20250514',\n        max_tokens: 1024,\n        system: systemPrompt,\n        tools: tools,\n        messages: toolMessages\n      });\n    }\n\n    const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';\n\n    await pool.query(\n      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',\n      [user_id, 'user', message]\n    );\n    await pool.query(\n      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',\n      [user_id, 'assistant', reply]\n    );\n\n    return res.json({ reply });\n  } catch (err) {\n    console.error(err);\n    res.status(500).json({ error: 'Errore Claude API: ' + err.message });\n  }\n});\n\napp.post('/memory/save', async (req, res) => {\n  const { user_id, object_name, location } = req.body;\n  if (!user_id || !object_name || !location) {\n    return res.status(400).json({ error: 'Parametri mancanti' });\n  }\n  try {\n    const existing = await pool.query(\n      'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',\n      [user_id, object_name]\n    );\n    if (existing.rows.length > 0) {\n      await pool.query(\n        'UPDATE memories SET location = $1, updated_at = NOW() WHERE user_id = $2 AND LOWER(object_name) = LOWER($3)',\n        [location, user_id, object_name]\n      );\n      return res.json({ success: true, action: 'updated', object_name, location });\n    } else {\n      await pool.query(\n        'INSERT INTO memories (user_id, object_name, location) VALUES ($1, $2, $3)',\n        [user_id, object_name, location]\n      );\n      return res.json({ success: true, action: 'saved', object_name, location });\n    }\n  } catch (err) {\n    console.error(err);\n    res.status(500).json({ error: 'Errore database' });\n  }\n});\n\napp.post('/memory/find', async (req, res) => {\n  const { user_id, object_name } = req.body;\n  if (!user_id || !object_name) {\n    return res.status(400).json({ error: 'Parametri mancanti' });\n  }\n  try {\n    const result = await pool.query(\n      'SELECT object_name, location FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',\n      [user_id, object_name]\n    );\n    if (result.rows.length > 0) {\n      return res.json({ found: true, object_name: result.rows[0].object_name, location: result.rows[0].location });\n    }\n    return res.json({ found: false, object_name });\n  } catch (err) {\n    console.error(err);\n    res.status(500).json({ error: 'Errore database' });\n  }\n});\n\napp.get('/memory/list', async (req, res) => {\n  const { user_id } = req.query;\n  if (!user_id) {\n    return res.status(400).json({ error: 'Parametro mancante: user_id' });\n  }\n  try {\n    const result = await pool.query(\n      'SELECT object_name, location, updated_at FROM memories WHERE user_id = $1 ORDER BY updated_at DESC',\n      [user_id]\n    );\n    return res.json({ items: result.rows });\n  } catch (err) {\n    console.error(err);\n    res.status(500).json({ error: 'Errore database' });\n  }\n});\n\napp.post('/reminder/save', async (req, res) => {\n  const { user_id, conversation_id, message, remind_at, channel, recurrence } = req.body;\n  if (!user_id || !message || !remind_at) {\n    return res.status(400).json({ error: 'Parametri mancanti' });\n  }\n  try {\n    await pool.query(\n      'INSERT INTO reminders (user_id, conversation_id, message, remind_at, channel, recurrence) VALUES ($1, $2, $3, $4, $5, $6)',\n      [user_id, conversation_id, message, remind_at, channel || 'whatsapp', recurrence || 'none']\n    );\n    return res.json({ success: true, message: 'Reminder salvato', remind_at });\n  } catch (err) {\n    console.error(err);\n    res.status(500).json({ error: 'Errore database' });\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Server Simona AI avviato sulla porta ${PORT}`);\n});
+       const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
+Parli sempre in italiano, sei amichevole, diretta e pratica.
+Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
+
+OGGETTI IN MEMORIA:
+${memoryText}
+
+REGOLE:
+- Rispondi sempre in italiano
+- Sii concisa e diretta
+- Usa i tool quando necessario senza chiedere conferma
+- Non mostrare mai JSON o dati tecnici all'utente
+- Se l'utente dice dove mette qualcosa, salvalo subito con save_object
+- Se l'utente chiede di creare un evento o reminder, crealo subito su Calendar
+- Se non hai un tool per eseguire un'azione, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
+- NON dire mai "fatto" o "ho eseguito" se non hai usato un tool
+- Sii sempre onesta su cosa puoi e non puoi fare
+REGOLE DI COMPORTAMENTO:
+- Parla sempre in italiano, in modo caldo e diretto come un'amica fidata
+- Sii proattiva: se vedi qualcosa di utile, suggeriscilo
+- Rispetta il tempo di Simona: sii sintetica quando serve
+- Salva subito qualsiasi informazione importante che Simona ti dice
+
+REGOLE OPERATIVE:
+- NON dire mai "fatto" senza aver verificato l'esito dell'azione
+- Se qualcosa non va, dillo subito con onestà
+- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE
+- Non mostrare mai JSON o dati tecnici
+
+MEMORIA OGGETTI:
+- Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object
+
+DOCUMENTI MEDICI:
+- Quando ricevi un PDF medico, analizzalo e fai un riassunto
+- Rinominalo: [Tipo documento]-Ricci Simona-DATA.pdf
+- Controlla sempre se esiste già prima di salvarlo
+- Archivia in cartella Drive dedicata
+
+PRODUZIONE E ORDINI:
+- Estrai sempre: Cliente, Ordine, Modello, Note
+- Organizza per cliente su Drive
+- Se richiesto, mostra il file direttamente in chat
+
+CALENDARIO:
+- Se Simona chiede di creare un evento, crealo subito su Calendar
+- Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;
+
+    let response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools: tools,
+      messages: conversationHistory
+    });
+
+    const toolMessages = [...conversationHistory];
+
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (block) => {
+          const result = await executeTool(block.name, block.input, user_id);
+          return {
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: JSON.stringify(result)
+          };
+        })
+      );
+
+      toolMessages.push({ role: 'assistant', content: response.content });
+      toolMessages.push({ role: 'user', content: toolResults });
+
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: tools,
+        messages: toolMessages
+      });
+    }
+
+    const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
+
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'user', message]
+    );
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'assistant', reply]
+    );
+
+    return res.json({ reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore Claude API: ' + err.message });
+  }
+});
+
+app.post('/memory/save', async (req, res) => {
+  const { user_id, object_name, location } = req.body;
+  if (!user_id || !object_name || !location) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
+      [user_id, object_name]
+    );
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'UPDATE memories SET location = $1, updated_at = NOW() WHERE user_id = $2 AND LOWER(object_name) = LOWER($3)',
+        [location, user_id, object_name]
+      );
+      return res.json({ success: true, action: 'updated', object_name, location });
+    } else {
+      await pool.query(
+        'INSERT INTO memories (user_id, object_name, location) VALUES ($1, $2, $3)',
+        [user_id, object_name, location]
+      );
+      return res.json({ success: true, action: 'saved', object_name, location });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore database' });
+  }
+});
+
+app.post('/memory/find', async (req, res) => {
+  const { user_id, object_name } = req.body;
+  if (!user_id || !object_name) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    const result = await pool.query(
+      'SELECT object_name, location FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
+      [user_id, object_name]
+    );
+    if (result.rows.length > 0) {
+      return res.json({ found: true, object_name: result.rows[0].object_name, location: result.rows[0].location });
+    }
+    return res.json({ found: false, object_name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore database' });
+  }
+});
+
+app.get('/memory/list', async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) {
+    return res.status(400).json({ error: 'Parametro mancante: user_id' });
+  }
+  try {
+    const result = await pool.query(
+      'SELECT object_name, location, updated_at FROM memories WHERE user_id = $1 ORDER BY updated_at DESC',
+      [user_id]
+    );
+    return res.json({ items: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore database' });
+  }
+});
+
+app.post('/reminder/save', async (req, res) => {
+  const { user_id, conversation_id, message, remind_at, channel, recurrence } = req.body;
+  if (!user_id || !message || !remind_at) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    await pool.query(
+      'INSERT INTO reminders (user_id, conversation_id, message, remind_at, channel, recurrence) VALUES ($1, $2, $3, $4, $5, $6)',
+      [user_id, conversation_id, message, remind_at, channel || 'whatsapp', recurrence || 'none']
+    );
+    return res.json({ success: true, message: 'Reminder salvato', remind_at });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Errore database' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server Simona AI avviato sulla porta ${PORT}`);
+});
