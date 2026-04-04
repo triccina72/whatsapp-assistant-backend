@@ -101,11 +101,11 @@ const tools = [
   },
   {
     name: 'save_profile',
-    description: 'Salva una regola, preferenza o informazione importante su Simona nella memoria permanente. Usa questo tool quando Simona ti dice una regola da ricordare sempre.',
+    description: 'Salva una regola, preferenza o informazione importante su Simona nella memoria permanente.',
     input_schema: {
       type: 'object',
       properties: {
-        key: { type: 'string', description: 'Nome breve della regola es: orario_calendario, preferenza_lingua' },
+        key: { type: 'string', description: 'Nome breve della regola es: orario_calendario' },
         value: { type: 'string', description: 'Valore o descrizione della regola' }
       },
       required: ['key', 'value']
@@ -160,11 +160,11 @@ const tools = [
   },
   {
     name: 'search_gmail_orders',
-    description: 'Cerca email di ordini tessuti nella casella Gmail',
+    description: 'Cerca email di ordini tessuti nella casella Gmail, legge anche i PDF allegati',
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Termine di ricerca es: numero ordine o riferimento' },
+        query: { type: 'string', description: 'Termine di ricerca es: numero ordine, riferimento, nome tessuto' },
         max_results: { type: 'number', description: 'Numero massimo di email da restituire, default 5' }
       },
       required: ['query']
@@ -287,12 +287,14 @@ async function executeTool(toolName, toolInput, userId) {
       orderBy: 'startTime',
       maxResults: 20
     });
-    return { events: events.data.items.map(e => ({
-      title: e.summary,
-      start: e.start.dateTime || e.start.date,
-      end: e.end.dateTime || e.end.date,
-      id: e.id
-    }))};
+    return {
+      events: events.data.items.map(e => ({
+        title: e.summary,
+        start: e.start.dateTime || e.start.date,
+        end: e.end.dateTime || e.end.date,
+        id: e.id
+      }))
+    };
   }
 
   if (toolName === 'search_drive') {
@@ -325,49 +327,53 @@ async function executeTool(toolName, toolInput, userId) {
       const limit = Math.min(messages.length, toolInput.max_results || 5);
       const toFetch = messages.slice(-limit);
       for await (const msg of client.fetch(toFetch, { source: true })) {
-  const parsed = await simpleParser(msg.source);
-  const emailData = {
-    subject: parsed.subject,
-    from: parsed.from?.text,
-    date: parsed.date,
-    text: parsed.text?.substring(0, 500),
-    attachments: []
-  };
-
-  if (parsed.attachments && parsed.attachments.length > 0) {
-    for (const attachment of parsed.attachments) {
-      if (attachment.contentType === 'application/pdf') {
-        const pdfBase64 = attachment.content.toString('base64');
-        const pdfResponse = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1024,
-          messages: [{
-            role: 'user',
-            content: [
-              {
-                type: 'document',
-                source: {
-                  type: 'base64',
-                  media_type: 'application/pdf',
-                  data: pdfBase64
-                }
-              },
-              {
-                type: 'text',
-                text: 'Estrai tutte le informazioni importanti da questo documento: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
-              }
-            ]
-          }]
-        });
-        emailData.attachments.push({
-          filename: attachment.filename,
-          content: pdfResponse.content[0].text
-        });
+        const parsed = await simpleParser(msg.source);
+        const emailData = {
+          subject: parsed.subject,
+          from: parsed.from?.text,
+          date: parsed.date,
+          text: parsed.text?.substring(0, 500),
+          attachments: []
+        };
+        if (parsed.attachments && parsed.attachments.length > 0) {
+          for (const attachment of parsed.attachments) {
+            if (attachment.contentType === 'application/pdf') {
+              const pdfBase64 = attachment.content.toString('base64');
+              const pdfResponse = await anthropic.messages.create({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 1024,
+                messages: [{
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'document',
+                      source: {
+                        type: 'base64',
+                        media_type: 'application/pdf',
+                        data: pdfBase64
+                      }
+                    },
+                    {
+                      type: 'text',
+                      text: 'Estrai tutte le informazioni importanti da questo documento: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
+                    }
+                  ]
+                }]
+              });
+              emailData.attachments.push({
+                filename: attachment.filename,
+                content: pdfResponse.content[0].text
+              });
+            }
+          }
+        }
+        results.push(emailData);
       }
+    } finally {
+      await client.logout();
     }
+    return { emails: results };
   }
-  results.push(emailData);
-}
 
   return { error: 'Tool non trovato' };
 }
@@ -446,6 +452,7 @@ PRODUZIONE E ORDINI:
 - Estrai sempre: Cliente, Ordine, Modello, Note
 - Organizza per cliente su Drive
 - Per cercare ordini tessuti usa search_gmail_orders
+- search_gmail_orders legge anche i PDF allegati alle email
 
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
