@@ -49,6 +49,15 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
   console.log('Database pronto.');
 }
 
@@ -203,6 +212,17 @@ app.post('/chat', async (req, res) => {
       ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
       : 'Nessun oggetto salvato.';
 
+    const history = await pool.query(
+      'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+      [user_id]
+    );
+    const conversationHistory = history.rows.reverse().map(r => ({
+      role: r.role,
+      content: r.content
+    }));
+
+    conversationHistory.push({ role: 'user', content: message });
+
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1000,
@@ -212,8 +232,8 @@ Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rom
 
 COSA SAI FARE:
 - Ricordare dove sono gli oggetti (memoria persistente)
-- Creare eventi e reminder su Google Calendar
-- Cercare documenti su Google Drive
+- Creare eventi su Google Calendar chiamando: POST https://whatsapp-assistant-backend-production.up.railway.app/calendar/create con { title, date_time (ISO 8601), duration_minutes, description }
+- Cercare documenti su Google Drive chiamando: POST https://whatsapp-assistant-backend-production.up.railway.app/drive/search con { query }
 - Rispondere a domande generali
 
 OGGETTI IN MEMORIA:
@@ -222,12 +242,23 @@ ${memoryText}
 REGOLE:
 - Rispondi sempre in italiano
 - Sii concisa e diretta
-- Se l'utente vuole creare un reminder o evento, chiedi conferma dei dettagli (data, ora, descrizione)
-- Se l'utente dice dove mette qualcosa, confermalo e ricordaglielo`,
-      messages: [{ role: 'user', content: message }]
+- Se l'utente conferma un evento, crealo SUBITO su Calendar
+- Se l'utente dice dove mette qualcosa, confermalo`,
+      messages: conversationHistory
     });
 
-    return res.json({ reply: response.content[0].text });
+    const reply = response.content[0].text;
+
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'user', message]
+    );
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [user_id, 'assistant', reply]
+    );
+
+    return res.json({ reply });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Errore Claude API' });
