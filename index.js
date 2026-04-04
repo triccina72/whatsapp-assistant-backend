@@ -147,21 +147,23 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'create_calendar_event') {
-    console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
-    const auth = getGoogleAuth();
-    const calendar = google.calendar({ version: 'v3', auth });
-    const startTime = new Date(toolInput.date_time);
-    const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
-    const event = await calendar.events.insert({
-      calendarId: 'primary',
-      requestBody: {
-        summary: toolInput.title,
-        description: toolInput.description || '',
-        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
-        end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
-      }
-    });
-    return { success: true, event_id: event.data.id, link: event.data.htmlLink };
+  console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
+  console.log('Auth email:', process.env.GOOGLE_SERVICE_ACCOUNT_KEY ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY).client_email : 'non trovata');
+  const auth = getGoogleAuth();
+  const calendar = google.calendar({ version: 'v3', auth });
+  const startTime = new Date(toolInput.date_time);
+  const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
+  const event = await calendar.events.insert({
+    calendarId: 'primary',
+    requestBody: {
+      summary: toolInput.title,
+      description: toolInput.description || '',
+      start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
+      end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+    }
+  });
+  console.log('Evento creato:', JSON.stringify(event.data));
+  return { success: true, event_id: event.data.id, link: event.data.htmlLink };
   }
 
   if (toolName === 'search_drive') {
