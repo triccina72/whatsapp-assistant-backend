@@ -94,7 +94,7 @@ const tools = [
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Titolo evento' },
-        date_time: { type: 'string', description: 'Data e ora in formato ISO 8601 es: 2026-04-05T15:30:00' },
+        date_time: { type: 'string', description: 'Data e ora ISO 8601 es: 2026-04-05T15:30:00' },
         duration_minutes: { type: 'number', description: 'Durata in minuti, default 60' },
         description: { type: 'string', description: 'Descrizione evento' }
       },
@@ -145,10 +145,9 @@ async function executeTool(toolName, toolInput, userId) {
     }
     return { found: false, object_name: toolInput.object_name };
   }
+
   if (toolName === 'create_calendar_event') {
-  console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
-  const auth = getGoogleAuth();
-  if (toolName === 'create_calendar_event') {
+    console.log('Chiamata Calendar con:', JSON.stringify(toolInput));
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const startTime = new Date(toolInput.date_time);
