@@ -60,6 +60,16 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_profile (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, key)
+    )
+  `);
   console.log('Database pronto.');
 }
 
@@ -90,6 +100,18 @@ const tools = [
     }
   },
   {
+    name: 'save_profile',
+    description: 'Salva una regola, preferenza o informazione importante su Simona nella memoria permanente. Usa questo tool quando Simona ti dice una regola da ricordare sempre.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Nome breve della regola es: orario_calendario, preferenza_lingua' },
+        value: { type: 'string', description: 'Valore o descrizione della regola' }
+      },
+      required: ['key', 'value']
+    }
+  },
+  {
     name: 'create_calendar_event',
     description: 'Crea un evento su Google Calendar',
     input_schema: {
@@ -113,6 +135,16 @@ const tools = [
         date: { type: 'string', description: 'Data evento in formato YYYY-MM-DD' }
       },
       required: ['title']
+    }
+  },
+  {
+    name: 'list_calendar_events',
+    description: 'Mostra gli eventi del calendario per un periodo',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: 'Numero di giorni da oggi, default 14' }
+      }
     }
   },
   {
@@ -170,6 +202,16 @@ async function executeTool(toolName, toolInput, userId) {
       return { found: true, object_name: result.rows[0].object_name, location: result.rows[0].location };
     }
     return { found: false, object_name: toolInput.object_name };
+  }
+
+  if (toolName === 'save_profile') {
+    await pool.query(
+      `INSERT INTO user_profile (user_id, key, value, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id, key) DO UPDATE SET value = $3, updated_at = NOW()`,
+      [userId, toolInput.key, toolInput.value]
+    );
+    return { success: true, key: toolInput.key, value: toolInput.value };
   }
 
   if (toolName === 'create_calendar_event') {
@@ -230,6 +272,27 @@ async function executeTool(toolName, toolInput, userId) {
     });
     console.log('Evento eliminato:', eventToDelete.summary);
     return { success: true, message: `Evento "${eventToDelete.summary}" eliminato` };
+  }
+
+  if (toolName === 'list_calendar_events') {
+    const auth = getGoogleAuth();
+    const calendar = google.calendar({ version: 'v3', auth });
+    const timeMin = new Date().toISOString();
+    const timeMax = new Date(Date.now() + (toolInput.days || 14) * 24 * 60 * 60 * 1000).toISOString();
+    const events = await calendar.events.list({
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      timeMin,
+      timeMax,
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 20
+    });
+    return { events: events.data.items.map(e => ({
+      title: e.summary,
+      start: e.start.dateTime || e.start.date,
+      end: e.end.dateTime || e.end.date,
+      id: e.id
+    }))};
   }
 
   if (toolName === 'search_drive') {
@@ -297,6 +360,14 @@ app.post('/chat', async (req, res) => {
       ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
       : 'Nessun oggetto salvato.';
 
+    const profile = await pool.query(
+      'SELECT key, value FROM user_profile WHERE user_id = $1 ORDER BY updated_at DESC',
+      [user_id]
+    );
+    const profileText = profile.rows.length > 0
+      ? profile.rows.map(r => `- ${r.key}: ${r.value}`).join('\n')
+      : 'Nessuna regola salvata.';
+
     const history = await pool.query(
       'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
       [user_id]
@@ -315,18 +386,22 @@ FUSO ORARIO: Europe/Rome. Usa SEMPRE l'orario esatto che ti dice Simona nel form
 OGGETTI IN MEMORIA:
 ${memoryText}
 
+REGOLE PERSONALI DI SIMONA (salvate in memoria permanente):
+${profileText}
+
 REGOLE DI COMPORTAMENTO:
 - Parla sempre in italiano, in modo caldo e diretto come un'amica fidata
 - Sii proattiva: se vedi qualcosa di utile, suggeriscilo
 - Rispetta il tempo di Simona: sii sintetica quando serve
-- Salva subito qualsiasi informazione importante che Simona ti dice
+- Salva subito qualsiasi informazione importante con save_profile
 
 REGOLE OPERATIVE:
 - NON dire mai "fatto" senza aver verificato l'esito dell'azione
 - Se qualcosa non va, dillo subito con onestà
-- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE: "Non posso farlo ancora, questa funzione non è disponibile"
+- Se non hai un tool per fare qualcosa, dillo CHIARAMENTE
 - Non mostrare mai JSON o dati tecnici all'utente
 - Sii sempre onesta su cosa puoi e non puoi fare
+- Se Simona ti dice una regola da ricordare sempre, salvala SUBITO con save_profile
 
 MEMORIA OGGETTI:
 - Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object
@@ -346,7 +421,8 @@ CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
 - Usa SEMPRE l'orario esatto che ti dice Simona nel formato 2026-04-05T15:30:00
 - NON aggiungere mai offset di fuso orario alla data
-- Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;
+- Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale
+- Per vedere gli eventi usa list_calendar_events`;
 
     let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
