@@ -176,15 +176,22 @@ async function executeTool(toolName, toolInput, userId) {
     console.log('Creazione evento:', JSON.stringify(toolInput));
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
-    const startTime = new Date(toolInput.date_time);
+    
+    const dateTimeWithTZ = toolInput.date_time + '+02:00';
+    const startTime = new Date(dateTimeWithTZ);
     const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
+    
+    const formatDateTime = (date) => {
+      return date.toISOString().replace('Z', '+02:00');
+    };
+
     const event = await calendar.events.insert({
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
       requestBody: {
         summary: toolInput.title,
         description: toolInput.description || '',
-        start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Rome' },
-end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
+        start: { dateTime: formatDateTime(startTime), timeZone: 'Europe/Rome' },
+        end: { dateTime: formatDateTime(endTime), timeZone: 'Europe/Rome' }
       }
     });
     console.log('Evento creato:', event.data.id);
@@ -196,10 +203,10 @@ end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Rome' }
     const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const timeMin = toolInput.date
-      ? new Date(toolInput.date + 'T00:00:00').toISOString()
+      ? new Date(toolInput.date + 'T00:00:00+02:00').toISOString()
       : new Date().toISOString();
     const timeMax = toolInput.date
-      ? new Date(toolInput.date + 'T23:59:59').toISOString()
+      ? new Date(toolInput.date + 'T23:59:59+02:00').toISOString()
       : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     const events = await calendar.events.list({
       calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
@@ -298,6 +305,7 @@ app.post('/chat', async (req, res) => {
     const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
 Parli sempre in italiano, sei amichevole, diretta e pratica.
 Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
+FUSO ORARIO: Europe/Rome (UTC+2). Quando crei eventi usa SEMPRE l'orario esatto che ti dice Simona senza modificarlo.
 
 OGGETTI IN MEMORIA:
 ${memoryText}
@@ -332,6 +340,7 @@ PRODUZIONE E ORDINI:
 
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
+- Usa SEMPRE l'orario esatto che ti dice Simona — il sistema gestisce il fuso orario automaticamente
 - Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale`;
 
     let response = await anthropic.messages.create({
