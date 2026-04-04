@@ -14,7 +14,7 @@ const pool = new Pool({
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 function getGoogleAuth() {
-  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   return new google.auth.JWT(
     credentials.client_email,
     null,
