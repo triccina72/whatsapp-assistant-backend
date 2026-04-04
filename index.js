@@ -125,6 +125,55 @@ const tools = [
     }
   }
 ];
+if (toolName === 'search_gmail_orders') {
+    const { ImapFlow } = require('imapflow');
+    const { simpleParser } = require('mailparser');
+    
+    const client = new ImapFlow({
+      host: 'imap.gmail.com',
+      port: 993,
+      secure: true,
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD
+      },
+      logger: false
+    });
+
+    await client.connect();
+    const results = [];
+    
+    await client.mailboxOpen('Ordini Tessuti');
+    
+    const messages = await client.search({ text: toolInput.query });
+    const limit = Math.min(messages.length, toolInput.max_results || 5);
+    const toFetch = messages.slice(-limit);
+    
+    for await (const msg of client.fetch(toFetch, { source: true })) {
+      const parsed = await simpleParser(msg.source);
+      results.push({
+        subject: parsed.subject,
+        from: parsed.from?.text,
+        date: parsed.date,
+        text: parsed.text?.substring(0, 500)
+      });
+    }
+    
+    await client.logout();
+    return { emails: results };
+  }
+{
+    name: 'search_gmail_orders',
+    description: 'Cerca email di ordini tessuti nella casella Gmail',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Termine di ricerca es: numero ordine o riferimento' },
+        max_results: { type: 'number', description: 'Numero massimo di email da restituire, default 5' }
+      },
+      required: ['query']
+    }
+  }
 
 async function executeTool(toolName, toolInput, userId) {
   if (toolName === 'save_object') {
