@@ -154,7 +154,7 @@ async function executeTool(toolName, toolInput, userId) {
   const startTime = new Date(toolInput.date_time);
   const endTime = new Date(startTime.getTime() + (toolInput.duration_minutes || 60) * 60000);
   const event = await calendar.events.insert({
-    calendarId: 'primary',
+    calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
     requestBody: {
       summary: toolInput.title,
       description: toolInput.description || '',
