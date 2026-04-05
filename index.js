@@ -309,6 +309,7 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'search_gmail_orders') {
+    console.log('Gmail search chiamata con:', JSON.stringify(toolInput));
     const client = new ImapFlow({
       host: 'imap.gmail.com',
       port: 993,
@@ -321,55 +322,84 @@ async function executeTool(toolName, toolInput, userId) {
     });
     await client.connect();
     const results = [];
+    const lock = await client.getMailboxLock('Ordini Tessuti');
     try {
-      await client.mailboxOpen('Ordini Tessuti');
-      const messages = await client.search({ text: toolInput.query });
-      const limit = Math.min(messages.length, toolInput.max_results || 5);
-      const toFetch = messages.slice(-limit);
-      for await (const msg of client.fetch(toFetch, { source: true })) {
-        const parsed = await simpleParser(msg.source);
+      console.log('Mailbox aperta, messaggi totali:', client.mailbox.exists);
+      
+      // Usa sintassi Gmail nativa per cercare
+      const uids = await client.search(
+        { gmraw: `label:Ordini-Tessuti` },
+        { uid: true }
+      );
+      console.log('UIDs trovati:', uids.length);
+      
+      const limit = Math.min(uids.length, toolInput.max_results || 5);
+      const toFetch = uids.slice(-limit);
+      
+      const messages = await client.fetchAll(toFetch, {
+        envelope: true,
+        bodyStructure: true
+      }, { uid: true });
+      
+      for (const msg of messages) {
         const emailData = {
-          subject: parsed.subject,
-          from: parsed.from?.text,
-          date: parsed.date,
-          text: parsed.text?.substring(0, 500),
+          subject: msg.envelope.subject,
+          from: msg.envelope.from?.[0]?.address,
+          date: msg.envelope.date,
           attachments: []
         };
-        if (parsed.attachments && parsed.attachments.length > 0) {
-          for (const attachment of parsed.attachments) {
-            if (attachment.contentType === 'application/pdf') {
-              const pdfBase64 = attachment.content.toString('base64');
-              const pdfResponse = await anthropic.messages.create({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 1024,
-                messages: [{
-                  role: 'user',
-                  content: [
-                    {
-                      type: 'document',
-                      source: {
-                        type: 'base64',
-                        media_type: 'application/pdf',
-                        data: pdfBase64
-                      }
-                    },
-                    {
-                      type: 'text',
-                      text: 'Estrai tutte le informazioni importanti da questo documento: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
-                    }
-                  ]
-                }]
-              });
-              emailData.attachments.push({
-                filename: attachment.filename,
-                content: pdfResponse.content[0].text
-              });
-            }
+        
+        // Trova parti PDF nella struttura
+        function findParts(node, path = '1') {
+          const parts = [];
+          if (!node) return parts;
+          if (node.childNodes) {
+            node.childNodes.forEach((child, i) => {
+              const childPath = node.childNodes.length === 1 ? path : `${path}.${i + 1}`;
+              parts.push(...findParts(child, childPath));
+            });
+          } else if (node.type === 'application' || node.disposition === 'attachment') {
+            parts.push({ path, type: node.type, subtype: node.subtype, filename: node.parameters?.name || node.dispositionParameters?.filename });
+          }
+          return parts;
+        }
+        
+        const pdfParts = findParts(msg.bodyStructure);
+        console.log('Parti trovate:', JSON.stringify(pdfParts));
+        
+        for (const part of pdfParts) {
+          try {
+            const { content } = await client.download(String(msg.uid), part.path, { uid: true });
+            const chunks = [];
+            for await (const chunk of content) chunks.push(chunk);
+            const pdfBase64 = Buffer.concat(chunks).toString('base64');
+            
+            const pdfResponse = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 1024,
+              messages: [{
+                role: 'user',
+                content: [
+                  {
+                    type: 'document',
+                    source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
+                  },
+                  { type: 'text', text: 'Estrai tutte le informazioni importanti: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.' }
+                ]
+              }]
+            });
+            emailData.attachments.push({
+              filename: part.filename || 'allegato.pdf',
+              content: pdfResponse.content[0].text
+            });
+          } catch (e) {
+            console.log('Errore download parte:', e.message);
           }
         }
         results.push(emailData);
       }
     } finally {
+      lock.release();
       await client.logout();
     }
     return { emails: results };
