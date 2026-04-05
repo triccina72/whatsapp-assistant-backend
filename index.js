@@ -456,36 +456,41 @@ async function executeTool(toolName, toolInput, userId) {
 }
 
 async function processMessage(userId, message) {
-  const memories = await pool.query(
-    'SELECT object_name, location FROM memories WHERE user_id = $1',
-    [userId]
-  );
-  const memoryText = memories.rows.length > 0
-    ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
-    : 'Nessun oggetto salvato.';
+  try {
+    console.log('processMessage START userId:', userId);
+    
+    const memories = await pool.query(
+      'SELECT object_name, location FROM memories WHERE user_id = $1',
+      [userId]
+    );
+    const memoryText = memories.rows.length > 0
+      ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
+      : 'Nessun oggetto salvato.';
 
-  const profile = await pool.query(
-    'SELECT key, value FROM user_profile WHERE user_id = $1 ORDER BY updated_at DESC',
-    [userId]
-  );
-  const profileText = profile.rows.length > 0
-    ? profile.rows.map(r => `- ${r.key}: ${r.value}`).join('\n')
-    : 'Nessuna regola salvata.';
+    const profile = await pool.query(
+      'SELECT key, value FROM user_profile WHERE user_id = $1 ORDER BY updated_at DESC',
+      [userId]
+    );
+    const profileText = profile.rows.length > 0
+      ? profile.rows.map(r => `- ${r.key}: ${r.value}`).join('\n')
+      : 'Nessuna regola salvata.';
 
-  const history = await pool.query(
-    'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
-    [userId]
-  );
-  const conversationHistory = history.rows.reverse()
-    .filter(r => r.role === 'user' || r.role === 'assistant')
-    .filter(r => typeof r.content === 'string' && r.content.trim().length > 0)
-    .map(r => ({
-      role: r.role,
-      content: r.content
-    }));
-  conversationHistory.push({ role: 'user', content: message });
+    const history = await pool.query(
+      'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+      [userId]
+    );
+    const conversationHistory = history.rows.reverse()
+      .filter(r => r.role === 'user' || r.role === 'assistant')
+      .filter(r => typeof r.content === 'string' && r.content.trim().length > 0)
+      .map(r => ({
+        role: r.role,
+        content: r.content
+      }));
+    conversationHistory.push({ role: 'user', content: message });
 
-  const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
+    console.log('processMessage: cronologia caricata, messaggi:', conversationHistory.length);
+
+    const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
 Parli sempre in italiano, sei amichevole, diretta e pratica.
 Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
 FUSO ORARIO: Europe/Rome. Usa SEMPRE l'orario esatto che ti dice Simona nel formato YYYY-MM-DDTHH:MM:SS senza aggiungere fuso orario.
@@ -497,10 +502,15 @@ REGOLE PERSONALI DI SIMONA (salvate in memoria permanente):
 ${profileText}
 
 REGOLE DI COMPORTAMENTO:
+- Dopo ogni ricerca o azione completata, riferisci SEMPRE il risultato a Simona prima di fare altro
+- Non salvare regole o fare altre azioni senza prima aver risposto alla richiesta principale
 - Parla sempre in italiano, in modo caldo e diretto come un'amica fidata
 - Sii proattiva: se vedi qualcosa di utile, suggeriscilo
 - Rispetta il tempo di Simona: sii sintetica quando serve
-
+- Salva subito qualsiasi informazione importante con save_profile
+- Se non capisci una richiesta o non hai abbastanza contesto, chiedi chiarimenti
+- Non rimanere MAI in silenzio — rispondi SEMPRE, anche solo per dire "non ho capito, puoi riformulare?" — il silenzio è VIETATO
+- Se una ricerca non trova risultati utili, dillo esplicitamente
 
 REGOLE OPERATIVE:
 - NON dire mai "fatto" senza aver verificato l'esito dell'azione
@@ -509,12 +519,6 @@ REGOLE OPERATIVE:
 - Non mostrare mai JSON o dati tecnici all'utente
 - Sii sempre onesta su cosa puoi e non puoi fare
 - Se Simona ti dice una regola da ricordare sempre, salvala SUBITO con save_profile
-- Salva subito qualsiasi informazione importante con save_profile
-- Se non capisci una richiesta o non hai abbastanza contesto, chiedi chiarimenti
-- Se una ricerca non trova risultati utili, dillo esplicitamente
-- Dopo ogni ricerca o azione completata, riferisci SEMPRE il risultato a Simona prima di fare altro
-- Non salvare regole o fare altre azioni senza prima aver risposto alla richiesta principale
-- Non rimanere MAI in silenzio — rispondi SEMPRE, anche solo per dire "non ho capito, puoi riformulare?" — il silenzio è VIETATO
 
 MEMORIA OGGETTI:
 - Quando Simona dice dove mette qualcosa, salvalo SUBITO con save_object
@@ -532,6 +536,8 @@ PRODUZIONE E ORDINI:
 - search_gmail_orders legge anche i PDF allegati alle email
 - Per cercare ordini tessuti usa search_gmail_orders con parole chiave separate es: "DEAL A273" non "RIF. DEAL A273_25"
 - Gmail cerca automaticamente email che contengono tutte le parole chiave
+- NON usare mai nomi di file PDF come query di ricerca
+
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
 - Usa SEMPRE l'orario esatto che ti dice Simona nel formato 2026-04-05T15:30:00
@@ -539,55 +545,69 @@ CALENDARIO:
 - Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale
 - Per vedere gli eventi usa list_calendar_events`;
 
-  let response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1024,
-    system: systemPrompt,
-    tools: tools,
-    messages: conversationHistory
-  });
+    console.log('processMessage: chiamata Claude API...');
 
-  const toolMessages = [...conversationHistory];
-
-  while (response.stop_reason === 'tool_use') {
-    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
-
-    const toolResults = await Promise.all(
-      toolUseBlocks.map(async (block) => {
-        const result = await executeTool(block.name, block.input, userId);
-        return {
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: JSON.stringify(result)
-        };
-      })
-    );
-
-    toolMessages.push({ role: 'assistant', content: response.content });
-    toolMessages.push({ role: 'user', content: toolResults });
-
-    response = await anthropic.messages.create({
+    let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
       tools: tools,
-      messages: toolMessages
+      messages: conversationHistory
     });
+
+    console.log('processMessage: risposta Claude ricevuta, stop_reason:', response.stop_reason);
+
+    const toolMessages = [...conversationHistory];
+
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      console.log('processMessage: tool chiamati:', toolUseBlocks.map(b => b.name));
+
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (block) => {
+          const result = await executeTool(block.name, block.input, userId);
+          return {
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: JSON.stringify(result)
+          };
+        })
+      );
+
+      toolMessages.push({ role: 'assistant', content: response.content });
+      toolMessages.push({ role: 'user', content: toolResults });
+
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: tools,
+        messages: toolMessages
+      });
+
+      console.log('processMessage: risposta dopo tool, stop_reason:', response.stop_reason);
+    }
+
+    const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
+
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [userId, 'user', message]
+    );
+    await pool.query(
+      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+      [userId, 'assistant', reply]
+    );
+
+    console.log('processMessage END, risposta lunghezza:', reply.length);
+    return reply;
+
+  } catch (err) {
+    console.error('processMessage ERRORE:', err.message, err.stack);
+    throw err;
   }
-
-  const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
-
-  await pool.query(
-    'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-    [userId, 'user', message]
-  );
-  await pool.query(
-    'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-    [userId, 'assistant', reply]
-  );
-
-  return reply;
 }
+
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
