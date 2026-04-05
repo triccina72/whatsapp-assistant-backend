@@ -2,8 +2,6 @@ const express = require('express');
 const { Pool } = require('pg');
 const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
-const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser');
 
 const app = express();
 app.use(express.json());
@@ -26,6 +24,17 @@ function getGoogleAuth() {
       'https://www.googleapis.com/auth/drive'
     ]
   );
+}
+
+function getGmailAuth() {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET
+  );
+  oauth2Client.setCredentials({
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN
+  });
+  return oauth2Client;
 }
 
 async function initDB() {
@@ -334,109 +343,113 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'search_gmail_orders') {
-    const client = new ImapFlow({
-      host: 'imap.gmail.com',
-      port: 993,
-      secure: true,
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
-      },
-      logger: false
+    const auth = getGmailAuth();
+    const gmail = google.gmail({ version: 'v1', auth });
+    const maxResults = toolInput.max_results || 5;
+
+    console.log('Gmail API search:', toolInput.query);
+
+    const searchResult = await gmail.users.messages.list({
+      userId: 'me',
+      q: `label:Ordini-Tessuti ${toolInput.query}`,
+      maxResults
     });
 
-    function findPDFParts(node, path = []) {
-      const parts = [];
-      const currentPath = path.length > 0 ? path.join('.') : '1';
-      if (node.type === 'application' &&
-          (node.subtype === 'pdf' || node.subtype === 'octet-stream')) {
-        parts.push({
-          part: currentPath,
-          filename: node.dispositionParameters?.filename ||
-                    node.parameters?.name || 'attachment.pdf'
-        });
-      }
-      if (node.childNodes) {
-        node.childNodes.forEach((child, i) => {
-          parts.push(...findPDFParts(child, [...path, i + 1]));
-        });
-      }
-      if (node.message) {
-        parts.push(...findPDFParts(node.message, [...path, 1]));
-      }
-      return parts;
+    if (!searchResult.data.messages || searchResult.data.messages.length === 0) {
+      console.log('Gmail API: nessuna email trovata');
+      return { emails: [] };
     }
 
-    await client.connect();
+    console.log('Gmail API: trovate', searchResult.data.messages.length, 'email');
     const results = [];
-    try {
-      await client.mailboxOpen('Ordini Tessuti');
-      const messages = await client.search({ text: toolInput.query });
-      console.log('Gmail: trovati', messages.length, 'messaggi per query:', toolInput.query);
-      const limit = Math.min(messages.length, toolInput.max_results || 5);
-      const toFetch = messages.slice(-limit);
 
-      for await (const msg of client.fetch(toFetch, {
-        envelope: true,
-        bodyStructure: true,
-        source: true
-      })) {
-        const parsed = await simpleParser(msg.source);
-        const emailData = {
-          subject: parsed.subject,
-          from: parsed.from?.text,
-          date: parsed.date,
-          text: parsed.text?.substring(0, 500),
-          attachments: []
-        };
-        console.log('BodyStructure completa:', JSON.stringify(msg.bodyStructure, null, 2));
-        const pdfParts = findPDFParts(msg.bodyStructure);
-        console.log('Email:', parsed.subject, '- PDF parts:', pdfParts.length, JSON.stringify(pdfParts));
+    for (const msgRef of searchResult.data.messages) {
+      const msg = await gmail.users.messages.get({
+        userId: 'me',
+        id: msgRef.id,
+        format: 'full'
+      });
 
-        for (const pdfPart of pdfParts) {
-          try {
-            const { content } = await client.download(msg.uid, pdfPart.part, { uid: true });
-            const chunks = [];
-            for await (const chunk of content) {
-              chunks.push(chunk);
-            }
-            const pdfBuffer = Buffer.concat(chunks);
-            const pdfBase64 = pdfBuffer.toString('base64');
+      const headers = msg.data.payload.headers;
+      const subject = headers.find(h => h.name === 'Subject')?.value || '';
+      const from = headers.find(h => h.name === 'From')?.value || '';
+      const date = headers.find(h => h.name === 'Date')?.value || '';
 
-            const pdfResponse = await anthropic.messages.create({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 1024,
-              messages: [{
-                role: 'user',
-                content: [
-                  {
-                    type: 'document',
-                    source: {
-                      type: 'base64',
-                      media_type: 'application/pdf',
-                      data: pdfBase64
-                    }
-                  },
-                  {
-                    type: 'text',
-                    text: 'Estrai tutte le informazioni importanti: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
-                  }
-                ]
-              }]
-            });
-            emailData.attachments.push({
-              filename: pdfPart.filename,
-              content: pdfResponse.content[0].text
-            });
-          } catch (err) {
-            console.error('Errore download PDF part:', pdfPart.part, err.message);
+      const emailData = {
+        subject,
+        from,
+        date,
+        text: '',
+        attachments: []
+      };
+
+      function extractParts(parts) {
+        if (!parts) return;
+        for (const part of parts) {
+          if (part.mimeType === 'text/plain' && part.body?.data) {
+            emailData.text = Buffer.from(part.body.data, 'base64').toString('utf-8').substring(0, 500);
           }
+          if (part.mimeType === 'application/pdf' && part.body?.attachmentId) {
+            emailData.attachments.push({
+              filename: part.filename,
+              attachmentId: part.body.attachmentId,
+              messageId: msgRef.id
+            });
+          }
+          if (part.parts) extractParts(part.parts);
         }
-        results.push(emailData);
       }
-    } finally {
-      await client.logout();
+
+      extractParts(msg.data.payload.parts);
+      if (msg.data.payload.mimeType === 'text/plain' && msg.data.payload.body?.data) {
+        emailData.text = Buffer.from(msg.data.payload.body.data, 'base64').toString('utf-8').substring(0, 500);
+      }
+
+      console.log('Email:', subject, '- PDF allegati:', emailData.attachments.length);
+
+      for (const att of emailData.attachments) {
+        try {
+          const attachment = await gmail.users.messages.attachments.get({
+            userId: 'me',
+            messageId: att.messageId,
+            id: att.attachmentId
+          });
+
+          const pdfBase64 = attachment.data.data.replace(/-/g, '+').replace(/_/g, '/');
+
+          const pdfResponse = await anthropic.messages.create({
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 1024,
+            messages: [{
+              role: 'user',
+              content: [
+                {
+                  type: 'document',
+                  source: {
+                    type: 'base64',
+                    media_type: 'application/pdf',
+                    data: pdfBase64
+                  }
+                },
+                {
+                  type: 'text',
+                  text: 'Estrai tutte le informazioni importanti: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
+                }
+              ]
+            }]
+          });
+
+          att.content = pdfResponse.content[0].text;
+          delete att.attachmentId;
+          delete att.messageId;
+        } catch (err) {
+          console.error('Errore lettura PDF:', err.message);
+        }
+      }
+
+      results.push(emailData);
     }
+
     return { emails: results };
   }
 
@@ -609,7 +622,7 @@ app.post('/memory/save', async (req, res) => {
   try {
     const existing = await pool.query(
       'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
-      [userId, object_name]
+      [user_id, object_name]
     );
     if (existing.rows.length > 0) {
       await pool.query(
