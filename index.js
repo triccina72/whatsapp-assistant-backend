@@ -604,10 +604,11 @@ app.post('/chat', async (req, res) => {
 
 app.post('/telegram', async (req, res) => {
   res.sendStatus(200);
+  let chatId = null;
   try {
     const update = req.body;
     if (!update.message || !update.message.text) return;
-    const chatId = update.message.chat.id;
+    chatId = update.message.chat.id;
     const userId = `telegram_${chatId}`;
     const message = update.message.text;
     console.log('Telegram messaggio da:', chatId, '-', message);
@@ -615,7 +616,7 @@ app.post('/telegram', async (req, res) => {
     await sendTelegramMessage(chatId, reply);
   } catch (err) {
     console.error('Errore Telegram:', err.message);
-    await sendTelegramMessage(chatId, 'Si è verificato un errore tecnico. Riprova tra qualche secondo!');
+    if (chatId) await sendTelegramMessage(chatId, 'Si è verificato un errore tecnico. Riprova tra qualche secondo!');
   }
 });
 
