@@ -477,10 +477,13 @@ async function processMessage(userId, message) {
     'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
     [userId]
   );
-  const conversationHistory = history.rows.reverse().map(r => ({
-    role: r.role,
-    content: r.content
-  }));
+  const conversationHistory = history.rows.reverse()
+    .filter(r => r.role === 'user' || r.role === 'assistant')
+    .filter(r => typeof r.content === 'string' && r.content.trim().length > 0)
+    .map(r => ({
+      role: r.role,
+      content: r.content
+    }));
   conversationHistory.push({ role: 'user', content: message });
 
   const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
