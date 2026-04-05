@@ -617,6 +617,7 @@ app.post('/telegram', async (req, res) => {
     const userId = `telegram_${chatId}`;
     const message = update.message.text;
     console.log('Telegram messaggio da:', chatId, '-', message);
+    await sendTelegramMessage(chatId, '⏳');
     const reply = await processMessage(userId, message);
     await sendTelegramMessage(chatId, reply);
   } catch (err) {
