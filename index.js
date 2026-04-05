@@ -351,7 +351,7 @@ async function executeTool(toolName, toolInput, userId) {
 
     const searchResult = await gmail.users.messages.list({
       userId: 'me',
-      q: `label:Ordini-Tessuti ${toolInput.query}`,
+      q: `label:"Ordini Tessuti" ${toolInput.query}`,
       maxResults
     });
 
@@ -611,6 +611,7 @@ app.post('/telegram', async (req, res) => {
     await sendTelegramMessage(chatId, reply);
   } catch (err) {
     console.error('Errore Telegram:', err.message);
+    await sendTelegramMessage(chatId, 'Si è verificato un errore tecnico. Riprova tra qualche secondo!');
   }
 });
 
