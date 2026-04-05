@@ -75,6 +75,31 @@ async function initDB() {
 
 initDB().catch(console.error);
 
+async function setupTelegramWebhook() {
+  if (!process.env.TELEGRAM_BOT_TOKEN) return;
+  const backendUrl = process.env.BACKEND_URL || 'https://whatsapp-assistant-backend-production.up.railway.app';
+  const webhookUrl = `${backendUrl}/telegram`;
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: webhookUrl })
+    });
+    const data = await response.json();
+    console.log('Telegram webhook:', data.ok ? 'configurato' : data.description);
+  } catch (err) {
+    console.error('Errore setup webhook Telegram:', err.message);
+  }
+}
+
+async function sendTelegramMessage(chatId, text) {
+  await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+  });
+}
+
 const tools = [
   {
     name: 'save_object',
@@ -323,11 +348,11 @@ async function executeTool(toolName, toolInput, userId) {
     function findPDFParts(node, path = []) {
       const parts = [];
       const currentPath = path.length > 0 ? path.join('.') : '1';
-      if (node.type === 'application' && 
+      if (node.type === 'application' &&
           (node.subtype === 'pdf' || node.subtype === 'octet-stream')) {
         parts.push({
           part: currentPath,
-          filename: node.dispositionParameters?.filename || 
+          filename: node.dispositionParameters?.filename ||
                     node.parameters?.name || 'attachment.pdf'
         });
       }
@@ -351,10 +376,10 @@ async function executeTool(toolName, toolInput, userId) {
       const limit = Math.min(messages.length, toolInput.max_results || 5);
       const toFetch = messages.slice(-limit);
 
-      for await (const msg of client.fetch(toFetch, { 
-        envelope: true, 
+      for await (const msg of client.fetch(toFetch, {
+        envelope: true,
         bodyStructure: true,
-        source: true 
+        source: true
       })) {
         const parsed = await simpleParser(msg.source);
         const emailData = {
@@ -366,11 +391,11 @@ async function executeTool(toolName, toolInput, userId) {
         };
 
         const pdfParts = findPDFParts(msg.bodyStructure);
-        console.log('Email:', parsed.subject, '- PDF parts trovati:', pdfParts.length, JSON.stringify(pdfParts));
+        console.log('Email:', parsed.subject, '- PDF parts:', pdfParts.length, JSON.stringify(pdfParts));
 
         for (const pdfPart of pdfParts) {
           try {
-            const { meta, content } = await client.download(msg.uid, pdfPart.part, { uid: true });
+            const { content } = await client.download(msg.uid, pdfPart.part, { uid: true });
             const chunks = [];
             for await (const chunk of content) {
               chunks.push(chunk);
@@ -404,7 +429,7 @@ async function executeTool(toolName, toolInput, userId) {
               content: pdfResponse.content[0].text
             });
           } catch (err) {
-            console.error('Errore download parte PDF:', pdfPart.part, err.message);
+            console.error('Errore download PDF part:', pdfPart.part, err.message);
           }
         }
         results.push(emailData);
@@ -418,43 +443,34 @@ async function executeTool(toolName, toolInput, userId) {
   return { error: 'Tool non trovato' };
 }
 
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
-});
+async function processMessage(userId, message) {
+  const memories = await pool.query(
+    'SELECT object_name, location FROM memories WHERE user_id = $1',
+    [userId]
+  );
+  const memoryText = memories.rows.length > 0
+    ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
+    : 'Nessun oggetto salvato.';
 
-app.post('/chat', async (req, res) => {
-  const { user_id, message } = req.body;
-  if (!user_id || !message) {
-    return res.status(400).json({ error: 'Parametri mancanti' });
-  }
-  try {
-    const memories = await pool.query(
-      'SELECT object_name, location FROM memories WHERE user_id = $1',
-      [user_id]
-    );
-    const memoryText = memories.rows.length > 0
-      ? memories.rows.map(r => `- ${r.object_name}: ${r.location}`).join('\n')
-      : 'Nessun oggetto salvato.';
+  const profile = await pool.query(
+    'SELECT key, value FROM user_profile WHERE user_id = $1 ORDER BY updated_at DESC',
+    [userId]
+  );
+  const profileText = profile.rows.length > 0
+    ? profile.rows.map(r => `- ${r.key}: ${r.value}`).join('\n')
+    : 'Nessuna regola salvata.';
 
-    const profile = await pool.query(
-      'SELECT key, value FROM user_profile WHERE user_id = $1 ORDER BY updated_at DESC',
-      [user_id]
-    );
-    const profileText = profile.rows.length > 0
-      ? profile.rows.map(r => `- ${r.key}: ${r.value}`).join('\n')
-      : 'Nessuna regola salvata.';
+  const history = await pool.query(
+    'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+    [userId]
+  );
+  const conversationHistory = history.rows.reverse().map(r => ({
+    role: r.role,
+    content: r.content
+  }));
+  conversationHistory.push({ role: 'user', content: message });
 
-    const history = await pool.query(
-      'SELECT role, content FROM conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
-      [user_id]
-    );
-    const conversationHistory = history.rows.reverse().map(r => ({
-      role: r.role,
-      content: r.content
-    }));
-    conversationHistory.push({ role: 'user', content: message });
-
-    const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
+  const systemPrompt = `Sei Simona AI, assistente personale di Simona Tricci.
 Parli sempre in italiano, sei amichevole, diretta e pratica.
 Data e ora attuale: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}
 FUSO ORARIO: Europe/Rome. Usa SEMPRE l'orario esatto che ti dice Simona nel formato YYYY-MM-DDTHH:MM:SS senza aggiungere fuso orario.
@@ -501,57 +517,87 @@ CALENDARIO:
 - Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale
 - Per vedere gli eventi usa list_calendar_events`;
 
-    let response = await anthropic.messages.create({
+  let response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1024,
+    system: systemPrompt,
+    tools: tools,
+    messages: conversationHistory
+  });
+
+  const toolMessages = [...conversationHistory];
+
+  while (response.stop_reason === 'tool_use') {
+    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+
+    const toolResults = await Promise.all(
+      toolUseBlocks.map(async (block) => {
+        const result = await executeTool(block.name, block.input, userId);
+        return {
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: JSON.stringify(result)
+        };
+      })
+    );
+
+    toolMessages.push({ role: 'assistant', content: response.content });
+    toolMessages.push({ role: 'user', content: toolResults });
+
+    response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
       tools: tools,
-      messages: conversationHistory
+      messages: toolMessages
     });
+  }
 
-    const toolMessages = [...conversationHistory];
+  const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
 
-    while (response.stop_reason === 'tool_use') {
-      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+  await pool.query(
+    'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+    [userId, 'user', message]
+  );
+  await pool.query(
+    'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
+    [userId, 'assistant', reply]
+  );
 
-      const toolResults = await Promise.all(
-        toolUseBlocks.map(async (block) => {
-          const result = await executeTool(block.name, block.input, user_id);
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: JSON.stringify(result)
-          };
-        })
-      );
+  return reply;
+}
 
-      toolMessages.push({ role: 'assistant', content: response.content });
-      toolMessages.push({ role: 'user', content: toolResults });
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
+});
 
-      response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: systemPrompt,
-        tools: tools,
-        messages: toolMessages
-      });
-    }
-
-    const reply = response.content.find(b => b.type === 'text')?.text || 'Fatto!';
-
-    await pool.query(
-      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-      [user_id, 'user', message]
-    );
-    await pool.query(
-      'INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)',
-      [user_id, 'assistant', reply]
-    );
-
+app.post('/chat', async (req, res) => {
+  const { user_id, message } = req.body;
+  if (!user_id || !message) {
+    return res.status(400).json({ error: 'Parametri mancanti' });
+  }
+  try {
+    const reply = await processMessage(user_id, message);
     return res.json({ reply });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Errore Claude API: ' + err.message });
+  }
+});
+
+app.post('/telegram', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const update = req.body;
+    if (!update.message || !update.message.text) return;
+    const chatId = update.message.chat.id;
+    const userId = `telegram_${chatId}`;
+    const message = update.message.text;
+    console.log('Telegram messaggio da:', chatId, '-', message);
+    const reply = await processMessage(userId, message);
+    await sendTelegramMessage(chatId, reply);
+  } catch (err) {
+    console.error('Errore Telegram:', err.message);
   }
 });
 
@@ -563,7 +609,7 @@ app.post('/memory/save', async (req, res) => {
   try {
     const existing = await pool.query(
       'SELECT id FROM memories WHERE user_id = $1 AND LOWER(object_name) = LOWER($2)',
-      [user_id, object_name]
+      [userId, object_name]
     );
     if (existing.rows.length > 0) {
       await pool.query(
@@ -639,6 +685,7 @@ app.post('/reminder/save', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server Simona AI avviato sulla porta ${PORT}`);
+  await setupTelegramWebhook();
 });
