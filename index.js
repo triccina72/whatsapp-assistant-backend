@@ -319,31 +319,43 @@ async function executeTool(toolName, toolInput, userId) {
       },
       logger: false
     });
+
+    function findPDFParts(node, path = []) {
+      const parts = [];
+      const currentPath = path.length > 0 ? path.join('.') : '1';
+      if (node.type === 'application' && 
+          (node.subtype === 'pdf' || node.subtype === 'octet-stream')) {
+        parts.push({
+          part: currentPath,
+          filename: node.dispositionParameters?.filename || 
+                    node.parameters?.name || 'attachment.pdf'
+        });
+      }
+      if (node.childNodes) {
+        node.childNodes.forEach((child, i) => {
+          parts.push(...findPDFParts(child, [...path, i + 1]));
+        });
+      }
+      if (node.message) {
+        parts.push(...findPDFParts(node.message, [...path, 1]));
+      }
+      return parts;
+    }
+
     await client.connect();
     const results = [];
     try {
       await client.mailboxOpen('Ordini Tessuti');
       const messages = await client.search({ text: toolInput.query });
+      console.log('Gmail: trovati', messages.length, 'messaggi per query:', toolInput.query);
       const limit = Math.min(messages.length, toolInput.max_results || 5);
       const toFetch = messages.slice(-limit);
 
-      async function extractPDFs(parsed) {
-        const pdfs = [];
-        if (parsed.attachments) {
-          for (const attachment of parsed.attachments) {
-            if (attachment.contentType === 'application/pdf' && attachment.content) {
-              pdfs.push({ filename: attachment.filename, content: attachment.content });
-            } else if (attachment.contentType === 'message/rfc822' && attachment.content) {
-              const nested = await simpleParser(attachment.content);
-              const nestedPDFs = await extractPDFs(nested);
-              pdfs.push(...nestedPDFs);
-            }
-          }
-        }
-        return pdfs;
-      }
-
-      for await (const msg of client.fetch(toFetch, { source: true })) {
+      for await (const msg of client.fetch(toFetch, { 
+        envelope: true, 
+        bodyStructure: true,
+        source: true 
+      })) {
         const parsed = await simpleParser(msg.source);
         const emailData = {
           subject: parsed.subject,
@@ -353,36 +365,47 @@ async function executeTool(toolName, toolInput, userId) {
           attachments: []
         };
 
-        const pdfs = await extractPDFs(parsed);
-        console.log(`Email "${parsed.subject}": trovati ${pdfs.length} PDF`);
+        const pdfParts = findPDFParts(msg.bodyStructure);
+        console.log('Email:', parsed.subject, '- PDF parts trovati:', pdfParts.length, JSON.stringify(pdfParts));
 
-        for (const pdf of pdfs) {
-          const pdfBase64 = pdf.content.toString('base64');
-          const pdfResponse = await anthropic.messages.create({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 1024,
-            messages: [{
-              role: 'user',
-              content: [
-                {
-                  type: 'document',
-                  source: {
-                    type: 'base64',
-                    media_type: 'application/pdf',
-                    data: pdfBase64
+        for (const pdfPart of pdfParts) {
+          try {
+            const { meta, content } = await client.download(msg.uid, pdfPart.part, { uid: true });
+            const chunks = [];
+            for await (const chunk of content) {
+              chunks.push(chunk);
+            }
+            const pdfBuffer = Buffer.concat(chunks);
+            const pdfBase64 = pdfBuffer.toString('base64');
+
+            const pdfResponse = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 1024,
+              messages: [{
+                role: 'user',
+                content: [
+                  {
+                    type: 'document',
+                    source: {
+                      type: 'base64',
+                      media_type: 'application/pdf',
+                      data: pdfBase64
+                    }
+                  },
+                  {
+                    type: 'text',
+                    text: 'Estrai tutte le informazioni importanti: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
                   }
-                },
-                {
-                  type: 'text',
-                  text: 'Estrai tutte le informazioni importanti da questo documento: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
-                }
-              ]
-            }]
-          });
-          emailData.attachments.push({
-            filename: pdf.filename,
-            content: pdfResponse.content[0].text
-          });
+                ]
+              }]
+            });
+            emailData.attachments.push({
+              filename: pdfPart.filename,
+              content: pdfResponse.content[0].text
+            });
+          } catch (err) {
+            console.error('Errore download parte PDF:', pdfPart.part, err.message);
+          }
         }
         results.push(emailData);
       }
