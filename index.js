@@ -433,7 +433,7 @@ async function executeTool(toolName, toolInput, userId) {
                 },
                 {
                   type: 'text',
-                  text: 'Estrai tutte le informazioni importanti: cliente, ordine, modello tessuto, quantità, note. Rispondi in italiano.'
+                  text: 'Analizza questo documento di ordine tessuti ed estrai: 1) Cliente (chi ha FATTO l\'ordine, non il fornitore), 2) Numero ordine/riferimento, 3) Modello/nome tessuto, 4) Quantità, 5) Note importanti. Rispondi in italiano in modo strutturato.'
                 }
               ]
             }]
@@ -499,6 +499,9 @@ REGOLE DI COMPORTAMENTO:
 - Sii proattiva: se vedi qualcosa di utile, suggeriscilo
 - Rispetta il tempo di Simona: sii sintetica quando serve
 - Salva subito qualsiasi informazione importante con save_profile
+- Se non capisci una richiesta o non hai abbastanza contesto, chiedi chiarimenti
+- Non rimanere mai in silenzio — rispondi SEMPRE anche solo per dire che non hai capito
+- Se una ricerca non trova risultati utili, dillo esplicitamente
 
 REGOLE OPERATIVE:
 - NON dire mai "fatto" senza aver verificato l'esito dell'azione
@@ -522,7 +525,8 @@ PRODUZIONE E ORDINI:
 - Organizza per cliente su Drive
 - Per cercare ordini tessuti usa search_gmail_orders
 - search_gmail_orders legge anche i PDF allegati alle email
-
+- Per cercare ordini tessuti usa search_gmail_orders con parole chiave separate es: "DEAL A273" non "RIF. DEAL A273_25"
+- Gmail cerca automaticamente email che contengono tutte le parole chiave
 CALENDARIO:
 - Se Simona chiede di creare un evento, crealo subito su Calendar
 - Usa SEMPRE l'orario esatto che ti dice Simona nel formato 2026-04-05T15:30:00
@@ -594,7 +598,7 @@ app.post('/chat', async (req, res) => {
     return res.json({ reply });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Errore Claude API: ' + err.message });
+    return 'Si è verificato un errore tecnico. Riprova!';
   }
 });
 
