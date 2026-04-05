@@ -405,8 +405,7 @@ async function executeTool(toolName, toolInput, userId) {
         emailData.text = Buffer.from(msg.data.payload.body.data, 'base64').toString('utf-8').substring(0, 500);
       }
 
-      console.log('Payload completo:', JSON.stringify(msg.data.payload, null, 2));
-
+      
       for (const att of emailData.attachments) {
         try {
           const attachment = await gmail.users.messages.attachments.get({
