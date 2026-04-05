@@ -389,7 +389,7 @@ async function executeTool(toolName, toolInput, userId) {
           text: parsed.text?.substring(0, 500),
           attachments: []
         };
-
+        console.log('BodyStructure completa:', JSON.stringify(msg.bodyStructure, null, 2));
         const pdfParts = findPDFParts(msg.bodyStructure);
         console.log('Email:', parsed.subject, '- PDF parts:', pdfParts.length, JSON.stringify(pdfParts));
 
