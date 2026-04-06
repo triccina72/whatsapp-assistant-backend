@@ -13,6 +13,12 @@ const pool = new Pool({
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ─── MODELLI ────────────────────────────────────────────────
+// Haiku per conversazione normale (4x più economico)
+// Sonnet solo per PDF e Vision (dove serve precisione)
+const MODEL_FAST  = 'claude-haiku-4-5-20251001';   // €0.08/MTok input
+const MODEL_SMART = 'claude-sonnet-4-20250514';     // €0.30/MTok input
+
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   return new google.auth.JWT(
@@ -47,6 +53,7 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reminders (
       id SERIAL PRIMARY KEY,
@@ -60,6 +67,7 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
       id SERIAL PRIMARY KEY,
@@ -69,6 +77,7 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_profile (
       id SERIAL PRIMARY KEY,
@@ -79,6 +88,7 @@ async function initDB() {
       UNIQUE(user_id, key)
     )
   `);
+
   console.log('Database pronto.');
 }
 
@@ -405,7 +415,6 @@ async function executeTool(toolName, toolInput, userId) {
         emailData.text = Buffer.from(msg.data.payload.body.data, 'base64').toString('utf-8').substring(0, 500);
       }
 
-      
       for (const att of emailData.attachments) {
         try {
           const attachment = await gmail.users.messages.attachments.get({
@@ -416,8 +425,9 @@ async function executeTool(toolName, toolInput, userId) {
 
           const pdfBase64 = attachment.data.data.replace(/-/g, '+').replace(/_/g, '/');
 
+          // ⚠️ Qui si usa MODEL_SMART (Sonnet) perché serve leggere PDF con precisione
           const pdfResponse = await anthropic.messages.create({
-            model: 'claude-sonnet-4-20250514',
+            model: MODEL_SMART,
             max_tokens: 1024,
             messages: [{
               role: 'user',
@@ -432,7 +442,17 @@ async function executeTool(toolName, toolInput, userId) {
                 },
                 {
                   type: 'text',
-                  text: 'Analizza questo documento di ordine tessuti ed estrai: 1) Cliente (chi ha FATTO l\'ordine, non il fornitore), 2) Numero ordine/riferimento, 3) Modello/nome tessuto, 4) Quantità, 5) Note importanti. Rispondi in italiano in modo strutturato.'
+                  text: `Sei un assistente esperto in documenti tessili. Analizza questo documento e rispondi SOLO con le seguenti informazioni in formato strutturato:
+
+TIPO DOCUMENTO: (ordine cliente / bolla fornitore / fattura / altro)
+FORNITORE: (chi VENDE o chi SPEDISCE il tessuto — nome azienda)
+CLIENTE: (chi ACQUISTA o chi RICEVE — nome azienda o persona)
+NUMERO ORDINE: (codice ordine o numero riferimento principale)
+RIFERIMENTI: (tutti i codici, numeri di articolo, SKU, riferimenti interni presenti)
+TESSUTI: (lista tessuti con codice articolo e metraggio per ognuno)
+NOTE: (qualsiasi altra informazione rilevante: date consegna, condizioni, avvertenze)
+
+Se un campo non è presente nel documento scrivi "non trovato".`
                 }
               ]
             }]
@@ -458,7 +478,7 @@ async function executeTool(toolName, toolInput, userId) {
 async function processMessage(userId, message) {
   try {
     console.log('processMessage START userId:', userId);
-    
+
     const memories = await pool.query(
       'SELECT object_name, location FROM memories WHERE user_id = $1',
       [userId]
@@ -530,7 +550,7 @@ DOCUMENTI MEDICI:
 - Archivia in cartella Drive dedicata
 
 PRODUZIONE E ORDINI:
-- Estrai sempre: Cliente, Ordine, Modello, Note
+- Estrai sempre: Fornitore, Cliente, Ordine, Riferimenti, Tessuti, Note
 - Organizza per cliente su Drive
 - Per cercare ordini tessuti usa search_gmail_orders
 - search_gmail_orders legge anche i PDF allegati alle email
@@ -545,10 +565,11 @@ CALENDARIO:
 - Se Simona chiede di eliminare un evento, eliminalo e conferma l'esito reale
 - Per vedere gli eventi usa list_calendar_events`;
 
-    console.log('processMessage: chiamata Claude API...');
+    console.log('processMessage: chiamata Claude API (modello:', MODEL_FAST, ')...');
 
+    // ✅ Usa MODEL_FAST (Haiku) per tutta la conversazione normale
     let response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: MODEL_FAST,
       max_tokens: 1024,
       system: systemPrompt,
       tools: tools,
@@ -577,8 +598,9 @@ CALENDARIO:
       toolMessages.push({ role: 'assistant', content: response.content });
       toolMessages.push({ role: 'user', content: toolResults });
 
+      // ✅ Usa MODEL_FAST (Haiku) anche per elaborare i risultati dei tool
       response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: MODEL_FAST,
         max_tokens: 1024,
         system: systemPrompt,
         tools: tools,
@@ -608,7 +630,6 @@ CALENDARIO:
   }
 }
 
-
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Backend Simona AI attivo' });
 });
@@ -623,7 +644,7 @@ app.post('/chat', async (req, res) => {
     return res.json({ reply });
   } catch (err) {
     console.error(err);
-    return 'Si è verificato un errore tecnico. Riprova!';
+    return res.status(500).json({ error: 'Errore interno. Riprova!' });
   }
 });
 
