@@ -16,7 +16,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MODEL_FAST  = 'claude-haiku-4-5-20251001';
 const MODEL_SMART = 'claude-sonnet-4-20250514';
 
-const DRIVE_ORDINI_TESSUTI_ID = process.env.DRIVE_ORDINI_TESSUTI_ID || '1pX-Qbam8QzQpZJgLecr4cfy4Uvy6r95L';
+const DRIVE_ORDINI_TESSUTI_ID  = process.env.DRIVE_ORDINI_TESSUTI_ID  || '1pX-Qbam8QzQpZJgLecr4cfy4Uvy6r95L';
+const DRIVE_ORDINI_CLIENTE_ID  = process.env.DRIVE_ORDINI_CLIENTE_ID  || '1V1npKBBZEQLPuKa01T8nWjsA4yEdoNNo';
 
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -82,21 +83,37 @@ async function initDB() {
     foto_etichetta_drive_id TEXT
   )`);
 
-  // Tabella ordini clienti
+  // Tabella ordini clienti (da foto documenti produzione)
   await pool.query(`CREATE TABLE IF NOT EXISTS ordini_clienti (
     id SERIAL PRIMARY KEY,
-    gmail_message_id TEXT UNIQUE,
+    numero_ov TEXT,
+    riga_ordine TEXT,
+    codice_modello TEXT,
+    descrizione_prodotto TEXT,
     cliente TEXT,
-    numero_ordine TEXT,
-    riferimenti TEXT,
+    rif_cliente TEXT,
+    doc_esterno TEXT,
+    commerciale TEXT,
+    data_scadenza TEXT,
+    piano_produzione TEXT,
+    seriali TEXT,
+    tessuto_principale TEXT,
+    codice_tessuto TEXT,
+    fornitore_tessuto TEXT,
+    metraggio_tessuto NUMERIC,
+    quantita INTEGER DEFAULT 1,
+    stato TEXT DEFAULT 'in_lavorazione',
     note TEXT,
-    stato TEXT DEFAULT 'aperto',
-    email_subject TEXT,
-    email_from TEXT,
-    email_date TEXT,
     drive_file_id TEXT,
     processed_at TIMESTAMP DEFAULT NOW()
   )`);
+  // Aggiungi colonne mancanti se la tabella esiste già (migrazione)
+  const colonne = ['numero_ov','riga_ordine','codice_modello','descrizione_prodotto','rif_cliente','doc_esterno','commerciale','data_scadenza','piano_produzione','seriali','tessuto_principale','codice_tessuto','fornitore_tessuto','metraggio_tessuto','quantita'];
+  for (const col of colonne) {
+    await pool.query(`ALTER TABLE ordini_clienti ADD COLUMN IF NOT EXISTS ${col} TEXT`).catch(()=>{});
+  }
+  await pool.query(`ALTER TABLE ordini_clienti ADD COLUMN IF NOT EXISTS metraggio_tessuto NUMERIC`).catch(()=>{});
+  await pool.query(`ALTER TABLE ordini_clienti ADD COLUMN IF NOT EXISTS quantita INTEGER DEFAULT 1`).catch(()=>{});
 
   // Colonna per tracciare ultima email processata
   await pool.query(`CREATE TABLE IF NOT EXISTS sync_state (
@@ -214,6 +231,56 @@ const tools = [
     name: 'forza_sync_gmail',
     description: 'Forza la sincronizzazione manuale delle email Gmail nuove nella cartella Ordini Tessuti',
     input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'gestisci_sync_automatica',
+    description: 'Attiva o disattiva la sincronizzazione automatica Gmail. Usa anche per vedere lo stato attuale.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        azione: { type: 'string', description: 'accendi | spegni | stato' }
+      },
+      required: ['azione']
+    }
+  },
+  {
+    name: 'registra_ordine_cliente',
+    description: 'Registra un ordine cliente nel database e carica la foto su Drive (cartella Ordini Cliente). Usare quando Simona fotografa un documento di produzione con OV, cliente, tessuto.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        numero_ov: { type: 'string', description: 'Numero ordine di vendita es. OV25_00480' },
+        riga_ordine: { type: 'string', description: 'Riga ordine es. 10000' },
+        codice_modello: { type: 'string', description: 'Codice modello prodotto es. BLLD1PTXT' },
+        descrizione_prodotto: { type: 'string', description: 'Descrizione es. Boll Poltrona Tessuto cat. Extreme' },
+        cliente: { type: 'string', description: 'Nome cliente es. RH INTERIEURS B.V.' },
+        rif_cliente: { type: 'string', description: 'Riferimento cliente es. SHOWROOM/ROTTERDAM' },
+        doc_esterno: { type: 'string', description: 'Documento esterno es. A648.24' },
+        commerciale: { type: 'string', description: 'Commerciale di riferimento' },
+        data_scadenza: { type: 'string', description: 'Data scadenza es. 06/05/25' },
+        piano_produzione: { type: 'string', description: 'Nr. piano di produzione es. 25PP000533' },
+        seriali: { type: 'string', description: 'Seriali SN es. SN2509249-SN2509250' },
+        tessuto_principale: { type: 'string', description: 'Nome tessuto principale es. DOMINO colore 2 Jacquard FR' },
+        codice_tessuto: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' },
+        fornitore_tessuto: { type: 'string', description: 'Fornitore del tessuto es. KVADRAT S.P.A.' },
+        metraggio_tessuto: { type: 'number', description: 'Metraggio previsto del tessuto' },
+        quantita: { type: 'number', description: 'Quantità pezzi' },
+        note: { type: 'string', description: 'Note aggiuntive' },
+        image_base64: { type: 'string', description: 'Foto del documento in base64 da caricare su Drive' }
+      },
+      required: ['numero_ov']
+    }
+  },
+  {
+    name: 'cerca_abbinamento_tessuto',
+    description: 'Cerca quali ordini clienti usano un determinato tessuto. Fondamentale quando arriva un tessuto: cerca sia negli ordini fornitore che negli ordini cliente per capire a quale lavorazione serve.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nome_tessuto: { type: 'string', description: 'Nome tessuto es. DOMINO colore 2, HERO 2, ecc.' },
+        codice_tessuto: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' }
+      }
+    }
   }
 ];
 
@@ -389,6 +456,117 @@ async function executeTool(toolName, toolInput, userId) {
     return { success: true, message: 'Sincronizzazione completata' };
   }
 
+  if (toolName === 'gestisci_sync_automatica') {
+    const azione = toolInput.azione?.toLowerCase();
+    if (azione === 'accendi') {
+      syncAutomaticaAttiva = true;
+      return { success: true, stato: 'attiva', message: 'Sync automatica attivata (lun-ven 7-19)' };
+    } else if (azione === 'spegni') {
+      syncAutomaticaAttiva = false;
+      return { success: true, stato: 'disattiva', message: 'Sync automatica disattivata' };
+    } else {
+      return { stato: syncAutomaticaAttiva ? 'attiva' : 'disattiva' };
+    }
+  }
+
+  if (toolName === 'registra_ordine_cliente') {
+    const {
+      numero_ov, riga_ordine, codice_modello, descrizione_prodotto,
+      cliente, rif_cliente, doc_esterno, commerciale,
+      data_scadenza, piano_produzione, seriali,
+      tessuto_principale, codice_tessuto, fornitore_tessuto, metraggio_tessuto,
+      quantita, note, image_base64
+    } = toolInput;
+
+    // Controlla se esiste già (stesso OV + riga)
+    const exists = await pool.query(
+      'SELECT id FROM ordini_clienti WHERE numero_ov=$1 AND (riga_ordine=$2 OR $2 IS NULL)',
+      [numero_ov, riga_ordine||null]
+    );
+    if (exists.rows.length > 0) {
+      return { success: false, message: `Ordine ${numero_ov} già presente nel DB (id: ${exists.rows[0].id})`, id: exists.rows[0].id };
+    }
+
+    // Carica foto su Drive se disponibile
+    let driveFileId = null;
+    if (image_base64) {
+      try {
+        const auth = getGoogleAuth();
+        const drive = google.drive({ version: 'v3', auth });
+        const buf = Buffer.from(image_base64, 'base64');
+        const { Readable } = require('stream');
+        const stream = new Readable();
+        stream.push(buf);
+        stream.push(null);
+        const nomeFile = `${numero_ov}${riga_ordine ? '_' + riga_ordine : ''}_${codice_modello || 'ordine'}.jpg`;
+        const driveResp = await drive.files.create({
+          requestBody: { name: nomeFile, parents: [DRIVE_ORDINI_CLIENTE_ID] },
+          media: { mimeType: 'image/jpeg', body: stream },
+          fields: 'id,webViewLink'
+        });
+        driveFileId = driveResp.data.id;
+      } catch(driveErr) { console.error('Errore Drive ordine cliente:', driveErr.message); }
+    }
+
+    const res = await pool.query(`
+      INSERT INTO ordini_clienti
+        (numero_ov, riga_ordine, codice_modello, descrizione_prodotto, cliente, rif_cliente,
+         doc_esterno, commerciale, data_scadenza, piano_produzione, seriali,
+         tessuto_principale, codice_tessuto, fornitore_tessuto, metraggio_tessuto,
+         quantita, note, drive_file_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      RETURNING id`,
+      [numero_ov, riga_ordine||null, codice_modello||null, descrizione_prodotto||null,
+       cliente||null, rif_cliente||null, doc_esterno||null, commerciale||null,
+       data_scadenza||null, piano_produzione||null, seriali||null,
+       tessuto_principale||null, codice_tessuto||null, fornitore_tessuto||null,
+       metraggio_tessuto||null, quantita||1, note||null, driveFileId]
+    );
+
+    return {
+      success: true,
+      id: res.rows[0].id,
+      drive_file_id: driveFileId,
+      numero_ov,
+      tessuto_principale,
+      message: `Ordine cliente ${numero_ov} registrato${driveFileId ? ' e foto caricata su Drive' : ''}`
+    };
+  }
+
+  if (toolName === 'cerca_abbinamento_tessuto') {
+    const { nome_tessuto, codice_tessuto } = toolInput;
+    const results = { ordini_clienti: [], ordini_tessuti: [] };
+
+    if (nome_tessuto || codice_tessuto) {
+      const paramVal = `%${(nome_tessuto || codice_tessuto).toLowerCase()}%`;
+
+      // Cerca negli ordini clienti
+      const clienti = await pool.query(`
+        SELECT id, numero_ov, riga_ordine, codice_modello, descrizione_prodotto,
+               cliente, tessuto_principale, codice_tessuto, data_scadenza, stato
+        FROM ordini_clienti
+        WHERE LOWER(tessuto_principale) LIKE $1 OR LOWER(codice_tessuto) LIKE $1
+        ORDER BY processed_at DESC LIMIT 10`,
+        [paramVal]
+      );
+      results.ordini_clienti = clienti.rows;
+
+      // Cerca negli ordini tessuti fornitore
+      const fornitori = await pool.query(`
+        SELECT o.id, o.fornitore, o.numero_ordine, o.stato,
+               t.codice_articolo, t.descrizione, t.metraggio, t.arrivato
+        FROM tessuti_righe t JOIN ordini_tessuti o ON t.ordine_id=o.id
+        WHERE LOWER(t.codice_articolo) LIKE $1 OR LOWER(t.descrizione) LIKE $1
+        ORDER BY o.processed_at DESC LIMIT 10`,
+        [paramVal]
+      );
+      results.ordini_tessuti = fornitori.rows;
+    }
+
+    const trovati = results.ordini_clienti.length + results.ordini_tessuti.length;
+    return { ...results, trovati };
+  }
+
   return { error: 'Tool non trovato' };
 }
 
@@ -528,8 +706,14 @@ async function syncGmailOrders() {
   }
 }
 
-// Job automatico ogni ora — solo lun-ven dalle 7 alle 19
+// Stato sync automatica — di default SPENTA, si accende/spegne via chat
+let syncAutomaticaAttiva = false;
+
 function syncSeOrarioLavorativo() {
+  if (!syncAutomaticaAttiva) {
+    console.log('Sync automatica disattivata, salto.');
+    return;
+  }
   const ora = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome', hour: 'numeric', hour12: false });
   const giorno = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome', weekday: 'short' });
   const h = parseInt(ora);
@@ -542,8 +726,6 @@ function syncSeOrarioLavorativo() {
   }
 }
 setInterval(syncSeOrarioLavorativo, 60 * 60 * 1000);
-// Prima sync al boot (dopo 30 secondi)
-setTimeout(syncSeOrarioLavorativo, 30000);
 
 // ─── PROCESS MESSAGE ─────────────────────────────────────────
 
@@ -588,18 +770,34 @@ COMPORTAMENTO:
 - Se Simona dice dove mette qualcosa → save_object subito
 - Salva regole importanti → save_profile subito
 
-ORDINI TESSUTI:
+GESTIONE FOTO — RICONOSCI SEMPRE IL TIPO:
+Quando Simona manda una foto, prima di tutto identifica di che tipo è:
+
+1. ORDINE CLIENTE (documento di produzione interno):
+   Riconosci se vedi: "OV25_XXXXX", "Nr. Piano di Produzione", "Lista Componenti", "Riferimenti Ordine", "Ordine - Riga"
+   → Estrai TUTTI i campi: numero_ov, riga_ordine, codice_modello, descrizione_prodotto, cliente, rif_cliente, doc_esterno, data_scadenza, piano_produzione, tessuto_principale (quello EVIDENZIATO in verde/giallo), codice_tessuto, fornitore_tessuto, metraggio
+   → Chiama registra_ordine_cliente con image_base64 = immagine ricevuta
+   → Poi chiama cerca_abbinamento_tessuto per vedere se il tessuto è già atteso da un fornitore
+   → Confirma a Simona: ordine registrato, cliente, tessuto usato, scadenza
+
+2. ETICHETTA TESSUTO FORNITORE:
+   Riconosci se vedi: etichetta con codice tessuto, nome tessuto, lotto, metraggio rotolo
+   → Estrai: nome tessuto, codice, lotto, metraggio
+   → Chiama cerca_abbinamento_tessuto per trovare ordine fornitore E ordini clienti che lo usano
+   → Chiama registra_arrivo_tessuto per aggiornare lo stato
+   → Conferma a Simona: tessuto arrivato, a quale ordine appartiene, a quale lavorazione serve
+
+3. BOLLA / DDT FORNITORE (documento cartaceo):
+   Riconosci se vedi: "Documento di Trasporto", "DDT", "Bolla di consegna", tabella con articoli e quantità
+   → Estrai: fornitore, numero documento, tessuti e metragi
+   → Cerca corrispondenza con cerca_ordini
+   → Aggiorna stato con registra_arrivo_tessuto
+
+ORDINI TESSUTI FORNITORE (da Gmail):
 - Per cercare ordini già processati usa cerca_ordini (più veloce)
 - Per email non ancora nel DB usa search_gmail_orders
-- Quando Simona fotografa un'etichetta → analizza l'immagine → estrai codici/riferimenti → cerca_ordini → registra_arrivo_tessuto
-- Quando un ordine diventa completo avvisa Simona con entusiasmo
+- Quando un ordine diventa completo avvisa Simona con entusiasmo 🎉
 - Tessuti nel DB vengono sincronizzati automaticamente da Gmail ogni ora
-
-FOTO ETICHETTE:
-- Se ricevi una foto, analizzala sempre attentamente
-- Cerca di estrarre: codice articolo, numero ordine, nome fornitore, metraggio
-- Poi cerca nel DB con cerca_ordini per trovare l'ordine corrispondente
-- Conferma a Simona cosa hai trovato e aggiorna lo stato
 
 CALENDARIO:
 - Formato: 2026-04-05T15:30:00 SENZA fuso orario
@@ -673,7 +871,6 @@ app.post('/telegram', async (req, res) => {
 
     // Gestione TESTO
     if (update.message.text) {
-      await sendTelegramMessage(chatId, '⏳');
       const reply = await processMessage(userId, update.message.text);
       await sendTelegramMessage(chatId, reply);
       return;
