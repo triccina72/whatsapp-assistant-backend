@@ -19,6 +19,9 @@ const MODEL_SMART = 'claude-sonnet-4-20250514';
 const DRIVE_ORDINI_TESSUTI_ID  = process.env.DRIVE_ORDINI_TESSUTI_ID  || '1pX-Qbam8QzQpZJgLecr4cfy4Uvy6r95L';
 const DRIVE_ORDINI_CLIENTE_ID  = process.env.DRIVE_ORDINI_CLIENTE_ID  || '1V1npKBBZEQLPuKa01T8nWjsA4yEdoNNo';
 
+// Cache immagini in attesa — keyed by userId, auto-pulita dopo il messaggio
+const pendingImages = new Map();
+
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   return new google.auth.JWT(
@@ -265,10 +268,9 @@ const tools = [
         fornitore_tessuto: { type: 'string', description: 'Fornitore del tessuto es. KVADRAT S.P.A.' },
         metraggio_tessuto: { type: 'number', description: 'Metraggio previsto del tessuto' },
         quantita: { type: 'number', description: 'Quantità pezzi' },
-        note: { type: 'string', description: 'Note aggiuntive' },
-        image_base64: { type: 'string', description: 'Foto del documento in base64 da caricare su Drive' }
+        note: { type: 'string', description: 'Note aggiuntive' }
       },
-      required: ['numero_ov']
+      required: []
     }
   },
   {
@@ -475,34 +477,42 @@ async function executeTool(toolName, toolInput, userId) {
       cliente, rif_cliente, doc_esterno, commerciale,
       data_scadenza, piano_produzione, seriali,
       tessuto_principale, codice_tessuto, fornitore_tessuto, metraggio_tessuto,
-      quantita, note, image_base64
+      quantita, note
     } = toolInput;
 
-    // Controlla se esiste già (stesso OV + riga)
-    const exists = await pool.query(
-      'SELECT id FROM ordini_clienti WHERE numero_ov=$1 AND (riga_ordine=$2 OR $2 IS NULL)',
-      [numero_ov, riga_ordine||null]
-    );
-    if (exists.rows.length > 0) {
-      return { success: false, message: `Ordine ${numero_ov} già presente nel DB (id: ${exists.rows[0].id})`, id: exists.rows[0].id };
+    // Blocca se non c'è nemmeno un dato minimo
+    if (!numero_ov && !codice_modello && !cliente && !tessuto_principale) {
+      return { success: false, message: 'Dati insufficienti — estrai almeno numero_ov o tessuto dalla foto prima di chiamare questo tool' };
     }
 
-    // Carica foto su Drive se disponibile
+    // Controlla se esiste già (stesso OV + riga)
+    if (numero_ov) {
+      const exists = await pool.query(
+        'SELECT id FROM ordini_clienti WHERE numero_ov=$1 AND (riga_ordine=$2 OR $2 IS NULL)',
+        [numero_ov, riga_ordine||null]
+      );
+      if (exists.rows.length > 0) {
+        return { success: false, message: `Ordine ${numero_ov} già presente nel DB (id: ${exists.rows[0].id})`, id: exists.rows[0].id };
+      }
+    }
+
+    // Carica foto su Drive dalla cache (l'immagine arriva dal Telegram handler)
     let driveFileId = null;
-    if (image_base64) {
+    const cached = pendingImages.get(userId);
+    if (cached?.base64) {
       try {
         const auth = getGoogleAuth();
         const drive = google.drive({ version: 'v3', auth });
-        const buf = Buffer.from(image_base64, 'base64');
+        const buf = Buffer.from(cached.base64, 'base64');
         const { Readable } = require('stream');
         const stream = new Readable();
         stream.push(buf);
         stream.push(null);
-        const nomeFile = `${numero_ov}${riga_ordine ? '_' + riga_ordine : ''}_${codice_modello || 'ordine'}.jpg`;
+        const nomeFile = `${numero_ov || 'ordine'}_${riga_ordine || ''}_${codice_modello || Date.now()}.jpg`;
         const driveResp = await drive.files.create({
           requestBody: { name: nomeFile, parents: [DRIVE_ORDINI_CLIENTE_ID] },
           media: { mimeType: 'image/jpeg', body: stream },
-          fields: 'id,webViewLink'
+          fields: 'id'
         });
         driveFileId = driveResp.data.id;
       } catch(driveErr) { console.error('Errore Drive ordine cliente:', driveErr.message); }
@@ -775,10 +785,11 @@ Quando Simona manda una foto, prima di tutto identifica di che tipo è:
 
 1. ORDINE CLIENTE (documento di produzione interno):
    Riconosci se vedi: "OV25_XXXXX", "Nr. Piano di Produzione", "Lista Componenti", "Riferimenti Ordine", "Ordine - Riga"
-   → Estrai TUTTI i campi: numero_ov, riga_ordine, codice_modello, descrizione_prodotto, cliente, rif_cliente, doc_esterno, data_scadenza, piano_produzione, tessuto_principale (quello EVIDENZIATO in verde/giallo), codice_tessuto, fornitore_tessuto, metraggio
-   → Chiama registra_ordine_cliente con image_base64 = immagine ricevuta
-   → Poi chiama cerca_abbinamento_tessuto per vedere se il tessuto è già atteso da un fornitore
-   → Confirma a Simona: ordine registrato, cliente, tessuto usato, scadenza
+   → OBBLIGATORIO: chiama SUBITO registra_ordine_cliente PRIMA di scrivere qualsiasi risposta
+   → NON dire "registro subito" senza aver chiamato il tool — le parole non bastano, serve la chiamata
+   → Estrai dal documento: numero_ov (es. OV25_00480), riga_ordine, codice_modello, descrizione_prodotto, cliente, rif_cliente, doc_esterno, data_scadenza, piano_produzione, tessuto_principale (quello evidenziato in verde/giallo nella foto), codice_tessuto, fornitore_tessuto, metraggio
+   → Dopo aver chiamato registra_ordine_cliente, chiama cerca_abbinamento_tessuto per vedere se il tessuto è già atteso da un fornitore
+   → Solo DOPO i tool calls, rispondi a Simona con: "✅ Ordine OV25_XXXXX registrato! Cliente: ... Tessuto: ... Scadenza: ..."
 
 2. ETICHETTA TESSUTO FORNITORE:
    Riconosci se vedi: etichetta con codice tessuto, nome tessuto, lotto, metraggio rotolo
@@ -859,13 +870,18 @@ app.post('/telegram', async (req, res) => {
     // Gestione FOTO
     if (update.message.photo) {
       await sendTelegramMessage(chatId, '📸 Analizzo la foto...');
-      // Prendi la foto di qualità più alta (ultima nell'array)
       const photos = update.message.photo;
       const bestPhoto = photos[photos.length - 1];
       const imageBase64 = await getTelegramPhotoBase64(bestPhoto.file_id);
+      // Metti l'immagine in cache — i tool la leggono da qui senza che Claude la ripassi
+      pendingImages.set(userId, { base64: imageBase64, timestamp: Date.now() });
       const caption = update.message.caption || 'Analizza questa foto e dimmi che tipo di documento è.';
-      const reply = await processMessage(userId, caption, imageBase64);
-      await sendTelegramMessage(chatId, reply);
+      try {
+        const reply = await processMessage(userId, caption, imageBase64);
+        await sendTelegramMessage(chatId, reply);
+      } finally {
+        pendingImages.delete(userId); // pulisci sempre dopo
+      }
       return;
     }
 
