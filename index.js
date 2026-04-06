@@ -390,7 +390,7 @@ async function executeTool(toolName, toolInput, userId) {
             model: MODEL_SMART, max_tokens: 1024,
             messages: [{ role: 'user', content: [
               { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } },
-              { type: 'text', text: 'Sei esperto in documenti tessili. Estrai:\nTIPO DOCUMENTO:\nFORNITORE: (chi VENDE/SPEDISCE)\nCLIENTE: (chi ACQUISTA/RICEVE)\nNUMERO ORDINE:\nRIFERIMENTI: (tutti i codici presenti)\nTESSUTI: (lista con codice articolo e metraggio per ognuno)\nNOTE:\nSe non presente scrivi non trovato.' }
+              { type: 'text', text: 'Sei esperto in documenti tessili. Questi documenti vengono sempre da fornitori che vendono tessuti a Domingo Salotti S.r.l. Estrai:\nTIPO DOCUMENTO: (ordine_a_fornitore|bolla_consegna|fattura|conferma_ordine|altro — MAI ordine_cliente)\nFORNITORE: (chi VENDE/SPEDISCE il tessuto, es. NOVATEX, KVADRAT)\nCLIENTE: (chi ACQUISTA, di solito Domingo Salotti)\nNUMERO ORDINE:\nRIFERIMENTI: (tutti i codici presenti)\nTESSUTI: (lista con codice articolo, nome tessuto+colore e metraggio per ognuno)\nNOTE: (date consegna, condizioni)\nSe non presente scrivi non trovato.' }
             ]}]
           });
           att.content = pdfResponse.content[0].text;
@@ -636,16 +636,20 @@ async function processEmailToOrder(gmail, msgRef) {
         model: MODEL_SMART, max_tokens: 1500,
         messages: [{ role: 'user', content: [
           { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } },
-          { type: 'text', text: `Analizza questo documento tessile ed estrai in formato JSON:
+          { type: 'text', text: `Analizza questo documento tessile ed estrai in formato JSON.
+CONTESTO: questi documenti sono sempre inviati da fornitori di tessuti a Domingo Salotti S.r.l. (Pesaro).
+Il FORNITORE è chi vende/spedisce il tessuto (es. NOVATEX, KVADRAT, ecc.).
+Il CLIENTE è sempre Domingo Salotti o simile — non usare mai "ordine_cliente" come tipo.
+
 {
-  "tipo_documento": "ordine_cliente|bolla_fornitore|fattura|altro",
-  "fornitore": "nome azienda che vende/spedisce",
-  "cliente": "nome azienda/persona che acquista/riceve",
-  "numero_ordine": "codice ordine principale",
+  "tipo_documento": "ordine_a_fornitore|bolla_consegna|fattura|conferma_ordine|altro",
+  "fornitore": "nome azienda che vende/spedisce il tessuto",
+  "cliente": "nome azienda che riceve (di solito Domingo Salotti)",
+  "numero_ordine": "codice ordine principale (es. OA26_01903)",
   "riferimenti": "tutti i codici, SKU, rif interni (stringa)",
   "note": "date consegna, condizioni, avvertenze",
   "tessuti": [
-    {"codice_articolo": "...", "descrizione": "...", "metraggio": 0.0, "unita": "mt"}
+    {"codice_articolo": "...", "descrizione": "nome tessuto e colore", "metraggio": 0.0, "unita": "mt"}
   ]
 }
 Rispondi SOLO con il JSON, nessun testo aggiuntivo.` }
