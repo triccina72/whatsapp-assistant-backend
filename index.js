@@ -528,10 +528,22 @@ async function syncGmailOrders() {
   }
 }
 
-// Job automatico ogni ora
-setInterval(syncGmailOrders, 60 * 60 * 1000);
-// Prima sync al boot (dopo 30 secondi per dare tempo al DB di inizializzarsi)
-setTimeout(syncGmailOrders, 30000);
+// Job automatico ogni ora — solo lun-ven dalle 7 alle 19
+function syncSeOrarioLavorativo() {
+  const ora = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome', hour: 'numeric', hour12: false });
+  const giorno = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome', weekday: 'short' });
+  const h = parseInt(ora);
+  const feriale = !['sab', 'dom'].includes(giorno.toLowerCase().substring(0,3));
+  if (feriale && h >= 7 && h < 19) {
+    console.log('Sync Gmail automatica...');
+    syncGmailOrders();
+  } else {
+    console.log(`Sync Gmail saltata (${giorno} ${h}:xx — fuori orario lavorativo)`);
+  }
+}
+setInterval(syncSeOrarioLavorativo, 60 * 60 * 1000);
+// Prima sync al boot (dopo 30 secondi)
+setTimeout(syncSeOrarioLavorativo, 30000);
 
 // ─── PROCESS MESSAGE ─────────────────────────────────────────
 
