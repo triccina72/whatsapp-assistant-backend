@@ -863,7 +863,7 @@ app.post('/telegram', async (req, res) => {
       const photos = update.message.photo;
       const bestPhoto = photos[photos.length - 1];
       const imageBase64 = await getTelegramPhotoBase64(bestPhoto.file_id);
-      const caption = update.message.caption || 'Analizza questa etichetta tessuto e cerca l\'ordine corrispondente nel database';
+      const caption = update.message.caption || 'Analizza questa foto e dimmi che tipo di documento è.';
       const reply = await processMessage(userId, caption, imageBase64);
       await sendTelegramMessage(chatId, reply);
       return;
