@@ -749,7 +749,7 @@ async function processMessage(userId, message, imageBase64 = null) {
     const memoryText = memories.rows.length > 0 ? memories.rows.map(r=>`- ${r.object_name}: ${r.location}`).join('\n') : 'Nessun oggetto salvato.';
     const profile = await pool.query('SELECT key, value FROM user_profile WHERE user_id=$1 ORDER BY updated_at DESC', [userId]);
     const profileText = profile.rows.length > 0 ? profile.rows.map(r=>`- ${r.key}: ${r.value}`).join('\n') : 'Nessuna regola salvata.';
-    const history = await pool.query('SELECT role, content FROM conversations WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10', [userId]);
+    const history = await pool.query('SELECT role, content FROM conversations WHERE user_id=$1 ORDER BY created_at DESC LIMIT 6', [userId]);
     const conversationHistory = history.rows.reverse()
       .filter(r=>(r.role==='user'||r.role==='assistant') && typeof r.content==='string' && r.content.trim().length>0)
       .map(r=>({ role: r.role, content: r.content }));
@@ -819,7 +819,7 @@ CALENDARIO:
 - NON aggiungere offset di fuso orario`;
 
     let response = await anthropic.messages.create({
-      model: imageBase64 ? MODEL_SMART : MODEL_FAST,
+      model: MODEL_FAST,
       max_tokens: 1024, system: systemPrompt, tools, messages: conversationHistory
     });
 
@@ -833,7 +833,7 @@ CALENDARIO:
       toolMessages.push({ role: 'assistant', content: response.content });
       toolMessages.push({ role: 'user', content: toolResults });
       response = await anthropic.messages.create({
-        model: imageBase64 ? MODEL_SMART : MODEL_FAST,
+        model: MODEL_FAST,
         max_tokens: 1024, system: systemPrompt, tools, messages: toolMessages
       });
     }
