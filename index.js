@@ -277,7 +277,7 @@ const tools = [
       type: 'object',
       properties: {
         nome_tessuto: { type: 'string', description: 'Nome tessuto es. DOMINO colore 2, HERO 2, ecc.' },
-         numero_ov:: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' }
+         numero_ov: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' },
         codice_tessuto: { type: 'string', description: 'Numero ordine di vendita es. OV25_00480' }
       }
     }
