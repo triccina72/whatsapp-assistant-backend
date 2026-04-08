@@ -253,18 +253,15 @@ const tools = [
       type: 'object',
       properties: {
         numero_ov: { type: 'string', description: 'Numero ordine di vendita es. OV25_00480' },
-        riga_ordine: { type: 'string', description: 'Riga ordine es. 10000' },
-        codice_modello: { type: 'string', description: 'Codice modello prodotto es. BLLD1PTXT' },
         descrizione_prodotto: { type: 'string', description: 'Descrizione es. Boll Poltrona Tessuto cat. Extreme' },
         cliente: { type: 'string', description: 'Nome cliente es. RH INTERIEURS B.V.' },
-        rif_cliente: { type: 'string', description: 'Riferimento cliente es. SHOWROOM/ROTTERDAM' },
-        doc_esterno: { type: 'string', description: 'Documento esterno es. A648.24' },
+        rif_del_cliente: { type: 'string', description: 'Riferimento del cliente es. SHOWROOM/ROTTERDAM' },
+        n_offerta: { type: 'string', description: 'N. Offerta es. A648.24, OF25_00134' },
         commerciale: { type: 'string', description: 'Commerciale di riferimento' },
         data_scadenza: { type: 'string', description: 'Data scadenza es. 06/05/25' },
         piano_produzione: { type: 'string', description: 'Nr. piano di produzione es. 25PP000533' },
-        seriali: { type: 'string', description: 'Seriali SN es. SN2509249-SN2509250' },
-        tessuto_principale: { type: 'string', description: 'Nome tessuto principale es. DOMINO colore 2 Jacquard FR' },
-        codice_tessuto: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' },
+        tessuto_principale: { type: 'string', description: 'Nome tessuto principale es. DOMINO colore 2 Jacquard FR, BOV LINEA COLORE 660-ASFALTO' },
+        codice_tessuto: { type: 'string', description: 'Codice articolo tessuto es. TESSDMNO0002, PELLINE0660' },
         fornitore_tessuto: { type: 'string', description: 'Fornitore del tessuto es. KVADRAT S.P.A.' },
         metraggio_tessuto: { type: 'number', description: 'Metraggio previsto del tessuto' },
         quantita: { type: 'number', description: 'Quantità pezzi' },
@@ -280,7 +277,8 @@ const tools = [
       type: 'object',
       properties: {
         nome_tessuto: { type: 'string', description: 'Nome tessuto es. DOMINO colore 2, HERO 2, ecc.' },
-        codice_tessuto: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' }
+         numero_ov:: { type: 'string', description: 'Codice articolo tessuto es. SDMNO0002' }
+        codice_tessuto: { type: 'string', description: 'Numero ordine di vendita es. OV25_00480' }
       }
     }
   }
@@ -788,23 +786,24 @@ GESTIONE FOTO — RICONOSCI SEMPRE IL TIPO:
 Quando Simona manda una foto, prima di tutto identifica di che tipo è:
 
 1. ORDINE CLIENTE (documento di produzione interno):
-   Riconosci se vedi: "OV25_XXXXX", "Nr. Piano di Produzione", "Lista Componenti", "Riferimenti Ordine", "Ordine - Riga"
+   Riconosci se vedi: "OV25_XXXXX", "Nr. Piano di Produzione", "Riferimenti Ordine", "Ordine"
    → OBBLIGATORIO: chiama SUBITO registra_ordine_cliente PRIMA di scrivere qualsiasi risposta
    → NON dire "registro subito" senza aver chiamato il tool — le parole non bastano, serve la chiamata
-   → Estrai dal documento: numero_ov (es. OV25_00480), riga_ordine, codice_modello, descrizione_prodotto, cliente, rif_cliente, doc_esterno, data_scadenza, piano_produzione, tessuto_principale (quello evidenziato in verde/giallo nella foto), codice_tessuto, fornitore_tessuto, metraggio
+   → Estrai dal documento: numero_ov (es. OV25_00480), ordine_ov, descrizione_prodotto, cliente, rif_del_decliente, n_offerta, data_scadenza, piano_produzione, tessuto_principale (quello a destra del codice che comincia per TEST o PELL), fornitore_tessuto, metraggio
    → Dopo aver chiamato registra_ordine_cliente, chiama cerca_abbinamento_tessuto per vedere se il tessuto è già atteso da un fornitore
    → Solo DOPO i tool calls, rispondi a Simona con: "✅ Ordine OV25_XXXXX registrato! Cliente: ... Tessuto: ... Scadenza: ..."
+   → Doo aver usato qualsiasi tool, concludi con un messaggio di reseconto"
 
 2. ETICHETTA TESSUTO FORNITORE:
    Riconosci se vedi: etichetta con codice tessuto, nome tessuto, lotto, metraggio rotolo
-   → Estrai: nome tessuto, codice, lotto, metraggio
+   → Estrai: nome tessuto, metraggio
    → Chiama cerca_abbinamento_tessuto per trovare ordine fornitore E ordini clienti che lo usano
    → Chiama registra_arrivo_tessuto per aggiornare lo stato
-   → Conferma a Simona: tessuto arrivato, a quale ordine appartiene, a quale lavorazione serve
+   → Conferma a Simona: tessuto arrivato, a quale ordine appartiene
 
 3. BOLLA / DDT FORNITORE (documento cartaceo):
    Riconosci se vedi: "Documento di Trasporto", "DDT", "Bolla di consegna", tabella con articoli e quantità
-   → Estrai: fornitore, numero documento, tessuti e metragi
+   → Estrai: fornitore, numero documento, tessuti e metraggi
    → Cerca corrispondenza con cerca_ordini
    → Aggiorna stato con registra_arrivo_tessuto
 
