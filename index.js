@@ -738,7 +738,48 @@ function syncSeOrarioLavorativo() {
   }
 }
 setInterval(syncSeOrarioLavorativo, 60 * 60 * 1000);
+// ─── CRON REMINDER ───────────────────────────────────────────
 
+async function checkAndSendReminders() {
+  try {
+    // Prendi tutti i reminder scaduti non ancora inviati
+    const result = await pool.query(`
+      SELECT * FROM reminders 
+      WHERE done = FALSE 
+      AND remind_at <= NOW()
+    `);
+
+    for (const reminder of result.rows) {
+      const chatId = reminder.user_id.replace('telegram_', '');
+      
+      // Manda il messaggio Telegram
+      await sendTelegramMessage(chatId, `⏰ Reminder: ${reminder.message}`);
+
+      // Gestisci ricorrenza
+      if (!reminder.recurrence || reminder.recurrence === 'none') {
+        // Segna come fatto
+        await pool.query('UPDATE reminders SET done=TRUE WHERE id=$1', [reminder.id]);
+      } else {
+        // Calcola prossima scadenza
+        let nextDate = new Date(reminder.remind_at);
+        if (reminder.recurrence === 'daily')   nextDate.setDate(nextDate.getDate() + 1);
+        if (reminder.recurrence === 'weekly')  nextDate.setDate(nextDate.getDate() + 7);
+        if (reminder.recurrence === 'monthly') nextDate.setMonth(nextDate.getMonth() + 1);
+        await pool.query(
+          'UPDATE reminders SET remind_at=$1 WHERE id=$2',
+          [nextDate.toISOString(), reminder.id]
+        );
+      }
+
+      console.log(`Reminder inviato a ${chatId}: ${reminder.message}`);
+    }
+  } catch(err) {
+    console.error('Errore checkReminders:', err.message);
+  }
+}
+
+// Controlla ogni minuto
+setInterval(checkAndSendReminders, 60 * 1000);
 // ─── PROCESS MESSAGE ─────────────────────────────────────────
 
 async function processMessage(userId, message, imageBase64 = null) {
