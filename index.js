@@ -832,6 +832,59 @@ async function checkAndSendReminders() {
 
 // Controlla ogni minuto
 setInterval(checkAndSendReminders, 60 * 1000);
+// ─── REMINDER GUARD ──────────────────────────────────────────
+
+function isReminderIntent(text) {
+  const lower = text.toLowerCase();
+  // Heuristics: Italian reminder trigger words and time expressions
+  const patterns = [
+    /ricordami|mi ricordi|promemoria|avvisami/,
+    /manda(?:mi)? un (?:avviso|messaggio)/,
+    /tra\s+\d+\s*(?:minut|or[ae]|giorn)/,
+    /domani|stasera|stamattina|stanotte/,
+    /alle\s+\d{1,2}[:.]\d{2}/,
+    /alle\s+\d{1,2}\s*(?:di mattina|di sera|del mattino|del pomeriggio|in punto)/
+  ];
+  return patterns.some(p => p.test(lower));
+}
+
+async function extractReminder(text, nowIsoRome) {
+  const prompt = `Sei un parser di promemoria. Data e ora attuale (Europe/Rome): ${nowIsoRome}.
+L'utente ha scritto: "${text}"
+
+Rispondi SOLO con JSON valido (nessun testo extra), in uno di questi formati:
+
+Se è un promemoria con data/ora chiara:
+{"is_reminder":true,"message":"<testo breve>","minutes_from_now":<intero o null>,"remind_at":"<YYYY-MM-DDTHH:MM:SS o null>","recurrence":"none"}
+
+Se è un promemoria ma manca data/ora:
+{"is_reminder":true,"message":"<testo breve>","minutes_from_now":null,"remind_at":null,"recurrence":"none"}
+
+Se NON è un promemoria:
+{"is_reminder":false}
+
+Regole:
+- message: cosa ricordare, senza "ricordami di"
+- "tra X minuti" → minutes_from_now=X; "tra X ore" → minutes_from_now=X*60
+- "domani alle HH:MM" o "stasera alle HH:MM" → remind_at YYYY-MM-DDTHH:MM:SS (Europe/Rome, senza offset)
+- recurrence: "none","daily","weekly","monthly"
+- Rispondi SOLO con il JSON, nessun markdown`;
+
+  const response = await anthropic.messages.create({
+    model: MODEL_FAST,
+    max_tokens: 256,
+    messages: [{ role: 'user', content: prompt }]
+  });
+
+  const raw = response.content.find(b => b.type === 'text')?.text?.trim() || '';
+  const jsonStr = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  try {
+    return JSON.parse(jsonStr);
+  } catch (parseErr) {
+    throw new Error(`[ReminderGuard] JSON parse failed. Raw response: ${raw.substring(0, 200)}`);
+  }
+}
+
 // ─── PROCESS MESSAGE ─────────────────────────────────────────
 
 async function processMessage(userId, message, imageBase64 = null) {
@@ -869,7 +922,6 @@ REGOLE PERSONALI:
 ${profileText}
 
 COMPORTAMENTO:
-- Rispondi SEMPRE prima di fare azioni
 - Parla in italiano come amica fidata, sintetica
 - Non mostrare mai JSON o dati tecnici
 - Se Simona dice dove mette qualcosa → save_object subito
@@ -991,7 +1043,62 @@ app.post('/telegram', async (req, res) => {
 
     // Gestione TESTO
     if (update.message.text) {
-      const reply = await processMessage(userId, update.message.text);
+      const text = update.message.text;
+
+      // ReminderGuard: se il testo sembra un promemoria, gestisci in modo sicuro
+      if (isReminderIntent(text)) {
+        console.log(`[ReminderGuard] intent detected for ${userId}: "${text}"`);
+        try {
+          const nowRome = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
+          const extracted = await extractReminder(text, nowRome);
+          console.log(`[ReminderGuard] extracted: ${JSON.stringify(extracted)}`);
+
+          if (!extracted.is_reminder) {
+            // Non è davvero un promemoria: gestione normale
+            const reply = await processMessage(userId, text);
+            await sendTelegramMessage(chatId, reply);
+            return;
+          }
+
+          if (extracted.minutes_from_now === null && !extracted.remind_at) {
+            // Data/ora ambigua: chiedi chiarimento
+            const clarify = 'Ok! Quando vuoi che te lo ricordi? Dimmi un orario (es. "tra 30 minuti" oppure "domani alle 9").';
+            await sendTelegramMessage(chatId, clarify);
+            await pool.query('INSERT INTO conversations (user_id, role, content) VALUES ($1,$2,$3)', [userId, 'user', text]);
+            await pool.query('INSERT INTO conversations (user_id, role, content) VALUES ($1,$2,$3)', [userId, 'assistant', clarify]);
+            return;
+          }
+
+          const toolInput = {
+            message: extracted.message,
+            remind_at: extracted.remind_at || null,
+            minutes_from_now: extracted.minutes_from_now || null,
+            recurrence: extracted.recurrence || 'none'
+          };
+          const result = await executeTool('create_reminder', toolInput, userId);
+          console.log(`[ReminderGuard] executeTool result: ${JSON.stringify(result)}`);
+
+          if (result.success) {
+            const reply = `✅ Fatto! Ti ricordo "${result.message}" il ${result.remind_at}. 🔔`;
+            await sendTelegramMessage(chatId, reply);
+            await pool.query('INSERT INTO conversations (user_id, role, content) VALUES ($1,$2,$3)', [userId, 'user', text]);
+            await pool.query('INSERT INTO conversations (user_id, role, content) VALUES ($1,$2,$3)', [userId, 'assistant', reply]);
+          } else {
+            console.error(`[ReminderGuard] create_reminder failed: ${result.error}`);
+            const reply = `Non sono riuscita a impostare il reminder. ${result.error || 'Riprova!'} `;
+            await sendTelegramMessage(chatId, reply);
+          }
+        } catch (extractErr) {
+          console.error(`[ReminderGuard] error: ${extractErr.message}`);
+          // Fallback alla gestione normale in caso di errore nell'estrazione
+          const reply = await processMessage(userId, text);
+          await sendTelegramMessage(chatId, reply);
+        }
+        return;
+      }
+
+      // Gestione normale (non-reminder)
+      const reply = await processMessage(userId, text);
       await sendTelegramMessage(chatId, reply);
       return;
     }
