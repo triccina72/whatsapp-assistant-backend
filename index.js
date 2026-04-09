@@ -838,6 +838,74 @@ async function checkAndSendReminders() {
 // Controlla ogni minuto
 setInterval(checkAndSendReminders, 60 * 1000);
 
+// ─── LISTA REMINDER ──────────────────────────────────────────
+
+const LISTA_REMINDER_PATTERNS = [
+  /^lista\s+reminder$/,
+  /^mostra\s+reminder$/,
+  /^reminder$/,
+];
+
+function isListaReminderCommand(text) {
+  const normalized = text.trim().toLowerCase();
+  return LISTA_REMINDER_PATTERNS.some(p => p.test(normalized));
+}
+
+function formatReminderTime(date) {
+  return new Date(date).toLocaleString('it-IT', {
+    timeZone: 'Europe/Rome',
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+const RECURRENCE_IT = { daily: 'ogni giorno', weekly: 'ogni settimana', monthly: 'ogni mese' };
+
+async function handleListaReminder(userId, chatId) {
+  console.log(`[lista-reminder] richiesta da ${userId}`);
+  const [pendingResult, doneResult] = await Promise.all([
+    pool.query(
+      `SELECT message, remind_at, recurrence FROM reminders
+       WHERE user_id=$1 AND done=FALSE
+       ORDER BY remind_at ASC`,
+      [userId]
+    ),
+    pool.query(
+      `SELECT message, remind_at FROM reminders
+       WHERE user_id=$1 AND done=TRUE
+       ORDER BY remind_at DESC LIMIT 10`,
+      [userId]
+    ),
+  ]);
+
+  const pending = pendingResult.rows;
+  const done = doneResult.rows;
+
+  let lines = [];
+
+  if (pending.length === 0) {
+    lines.push('📭 Nessun reminder in attesa.');
+  } else {
+    lines.push(`📌 In attesa (${pending.length}):`);
+    for (const r of pending) {
+      const recLabel = r.recurrence && r.recurrence !== 'none'
+        ? ` ♻️ ${RECURRENCE_IT[r.recurrence] || r.recurrence}`
+        : '';
+      lines.push(`• ${r.message} — ${formatReminderTime(r.remind_at)}${recLabel}`);
+    }
+  }
+
+  if (done.length > 0) {
+    lines.push('');
+    lines.push(`✅ Completati (ultimi ${done.length}):`);
+    for (const r of done) {
+      lines.push(`• ${r.message} — ${formatReminderTime(r.remind_at)}`);
+    }
+  }
+
+  await sendTelegramMessage(chatId, lines.join('\n'));
+}
+
 // ─── FATTO COMPLETION ────────────────────────────────────────
 
 const MIN_SUBJECT_WORD_LENGTH = 3; // parole più corte non sono abbastanza discriminanti
@@ -1067,6 +1135,12 @@ app.post('/telegram', async (req, res) => {
     // Gestione TESTO
     if (update.message.text) {
       const text = update.message.text;
+
+      // Comando: lista / mostra reminder
+      if (isListaReminderCommand(text)) {
+        await handleListaReminder(userId, chatId);
+        return;
+      }
 
       // Rileva intento di completamento ("fatto", "ho fatto", ecc.)
       const { isCompletion, subject } = detectCompletionIntent(text);
