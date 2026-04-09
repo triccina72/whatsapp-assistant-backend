@@ -22,6 +22,9 @@ const DRIVE_ORDINI_CLIENTE_ID  = process.env.DRIVE_ORDINI_CLIENTE_ID  || '1V1npK
 // Cache immagini in attesa — keyed by userId, auto-pulita dopo il messaggio
 const pendingImages = new Map();
 
+// Traccia l'ultimo reminder ricorrente inviato per utente (in memoria)
+const lastSentByUser = new Map(); // userId -> { id, message }
+
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   return new google.auth.JWT(
@@ -812,6 +815,8 @@ async function checkAndSendReminders() {
         // Segna come fatto
         await pool.query('UPDATE reminders SET done=TRUE WHERE id=$1', [reminder.id]);
       } else {
+        // Ricorda l'ultimo reminder ricorrente inviato a questo utente (per "fatto" context)
+        lastSentByUser.set(reminder.user_id, { id: reminder.id, message: reminder.message });
         // Calcola prossima scadenza
         let nextDate = new Date(reminder.remind_at);
         if (reminder.recurrence === 'daily')   nextDate.setDate(nextDate.getDate() + 1);
@@ -832,6 +837,76 @@ async function checkAndSendReminders() {
 
 // Controlla ogni minuto
 setInterval(checkAndSendReminders, 60 * 1000);
+
+// ─── FATTO COMPLETION ────────────────────────────────────────
+
+const MIN_SUBJECT_WORD_LENGTH = 3; // parole più corte non sono abbastanza discriminanti
+const MAX_GOALS_TO_DISPLAY = 3;    // numero massimo di goal mostrati nella domanda di chiarimento
+
+// Rileva se un messaggio esprime l'intenzione di completare un obiettivo.
+// Restituisce { isCompletion: boolean, subject: string|null }
+function detectCompletionIntent(text) {
+  const normalized = text.trim().toLowerCase();
+  const patterns = [
+    /^ok\s+fatto\b(.*)/,
+    /^l['']ho\s+fatto\b(.*)/,
+    /^ho\s+fatto\b(.*)/,
+    /^fatto\b(.*)/,
+    /^completato\b(.*)/,
+    /^finito\b(.*)/,
+  ];
+  for (const pattern of patterns) {
+    const m = normalized.match(pattern);
+    if (m) {
+      const subject = m[1].replace(/^[\s:,]+/, '').trim() || null;
+      return { isCompletion: true, subject: subject || null };
+    }
+  }
+  return { isCompletion: false, subject: null };
+}
+
+// Trova il reminder ricorrente aperto più adatto per un utente.
+// Restituisce { reminder: obj|null, ambiguous: boolean, openGoals: [] }
+async function findGoalReminder(userId, subject) {
+  const result = await pool.query(`
+    SELECT * FROM reminders
+    WHERE user_id=$1 AND channel='telegram' AND done=FALSE
+      AND recurrence IS NOT NULL AND recurrence != 'none'
+    ORDER BY remind_at ASC
+  `, [userId]);
+
+  const openGoals = result.rows;
+
+  if (openGoals.length === 0) return { reminder: null, ambiguous: false, openGoals: [] };
+  if (openGoals.length === 1 && !subject) return { reminder: openGoals[0], ambiguous: false, openGoals };
+
+  // Prova a fare match sul soggetto fornito dall'utente
+  if (subject && subject.length > 0) {
+    const subjectWords = subject.split(/\s+/).filter(w => w.length > MIN_SUBJECT_WORD_LENGTH);
+    let bestMatch = null;
+    let bestScore = 0;
+    for (const g of openGoals) {
+      const msgLower = g.message.toLowerCase();
+      let score = 0;
+      for (const word of subjectWords) {
+        if (msgLower.includes(word)) score++;
+      }
+      if (score > bestScore) { bestScore = score; bestMatch = g; }
+    }
+    if (bestScore > 0) return { reminder: bestMatch, ambiguous: false, openGoals };
+  }
+
+  // Nessun soggetto o nessun match: prova il contesto dell'ultimo reminder inviato
+  const lastSent = lastSentByUser.get(userId);
+  if (lastSent) {
+    const match = openGoals.find(g => g.id === lastSent.id);
+    if (match) return { reminder: match, ambiguous: false, openGoals };
+  }
+
+  // Ambiguo: più goal aperti, nessun contesto sufficiente
+  return { reminder: null, ambiguous: openGoals.length > 1, openGoals };
+}
+
 // ─── PROCESS MESSAGE ─────────────────────────────────────────
 
 async function processMessage(userId, message, imageBase64 = null) {
@@ -991,7 +1066,34 @@ app.post('/telegram', async (req, res) => {
 
     // Gestione TESTO
     if (update.message.text) {
-      const reply = await processMessage(userId, update.message.text);
+      const text = update.message.text;
+
+      // Rileva intento di completamento ("fatto", "ho fatto", ecc.)
+      const { isCompletion, subject } = detectCompletionIntent(text);
+      if (isCompletion) {
+        const { reminder, ambiguous, openGoals } = await findGoalReminder(userId, subject);
+
+        if (reminder) {
+          // Chiudi tutti i reminder ricorrenti con lo stesso messaggio/obiettivo per questo utente
+          await pool.query(
+            `UPDATE reminders SET done=TRUE
+             WHERE user_id=$1 AND channel='telegram' AND LOWER(message)=LOWER($2)
+               AND done=FALSE AND recurrence IS NOT NULL AND recurrence != 'none'`,
+            [userId, reminder.message]
+          );
+          lastSentByUser.delete(userId);
+          await sendTelegramMessage(chatId, `Perfetto ✅ Segno come fatto: "${reminder.message}"`);
+          return;
+        }
+
+        if (ambiguous) {
+          const list = openGoals.slice(0, MAX_GOALS_TO_DISPLAY).map((g, i) => `${i + 1}. ${g.message}`).join('\n');
+          await sendTelegramMessage(chatId, `Ok—quale intendi? 🤔\n${list}`);
+          return;
+        }
+      }
+
+      const reply = await processMessage(userId, text);
       await sendTelegramMessage(chatId, reply);
       return;
     }
