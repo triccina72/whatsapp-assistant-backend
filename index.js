@@ -103,19 +103,23 @@ Data/ora attuale: ${nowStr}`;
   }
 }
 
+// Numero massimo di minuti per un intervallo goal (1 giorno)
+const MAX_INTERVAL_MINUTES = 1440;
+
 // ─── INTERVAL AND TIME PARSERS ───────────────────────────────
 
 // Restituisce il numero di minuti da una frase italiana di intervallo
 function parseIntervalMinutes(text) {
   const t = text.toLowerCase().trim();
-  const mMin = t.match(/(?:ogni\s+)?(\d+)\s*min(?:uti?)?/);
+  // Usa \b per ancorare i numeri ed evitare backtracking su sequenze ripetitive
+  const mMin = t.match(/\b(\d{1,4})\s*min(?:uti?)?/);
   if (mMin) return parseInt(mMin[1]);
-  const mOreN = t.match(/(?:ogni\s+)?(\d+)\s*or[ae]/);
-  if (mOreN) return parseInt(mOreN[1]) * 60;
+  const mHours = t.match(/\b(\d{1,3})\s*or[ae]/);
+  if (mHours) return parseInt(mHours[1]) * 60;
   if (/\bogni\s+ora\b|^un['']?\s*ora$|^1\s*h$/.test(t)) return 60;
-  const mH = t.match(/(?:ogni\s+)?(\d+)\s*h\b/);
+  const mH = t.match(/\b(\d{1,3})\s*h\b/);
   if (mH) return parseInt(mH[1]) * 60;
-  const mNumOnly = t.match(/^(\d+)$/);
+  const mNumOnly = t.match(/^(\d{1,4})$/);
   if (mNumOnly) return parseInt(mNumOnly[1]);
   return null;
 }
@@ -289,7 +293,7 @@ async function handleGoalSessionReply(userId, chatId, text, session) {
 
   if (state === 'awaiting_interval') {
     const intervalMin = parseIntervalMinutes(text);
-    if (!intervalMin || intervalMin < 1 || intervalMin > 1440) {
+    if (!intervalMin || intervalMin < 1 || intervalMin > MAX_INTERVAL_MINUTES) {
       await sendTelegramMessage(chatId,
         'Non ho capito l\'intervallo. Prova con: "ogni 30 minuti", "ogni ora", "ogni 2 ore"'
       );
@@ -435,7 +439,8 @@ async function initDB() {
   )`);
 
   // Migrazione: aggiungi goal_type alla tabella reminders (se non esiste già)
-  await pool.query(`ALTER TABLE reminders ADD COLUMN IF NOT EXISTS goal_type TEXT DEFAULT NULL`).catch(() => {});
+  await pool.query(`ALTER TABLE reminders ADD COLUMN IF NOT EXISTS goal_type TEXT DEFAULT NULL`)
+    .catch(err => console.log('[DB] goal_type column migration:', err.message));
 
   // Tabella sessioni goal (stato macchina per creazione goal multi-turno)
   await pool.query(`CREATE TABLE IF NOT EXISTS goal_sessions (
