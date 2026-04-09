@@ -962,6 +962,21 @@ app.post('/chat', async (req, res) => {
   } catch(err) { return res.status(500).json({ error: 'Errore interno. Riprova!' }); }
 });
 
+function fmtReminderDateTime(d) {
+  return new Date(d).toLocaleString('it-IT', {
+    timeZone: 'Europe/Rome',
+    day: '2-digit', month: '2-digit',
+    hour: '2-digit', minute: '2-digit'
+  });
+}
+
+function fmtReminderTime(d) {
+  return new Date(d).toLocaleString('it-IT', {
+    timeZone: 'Europe/Rome',
+    hour: '2-digit', minute: '2-digit'
+  });
+}
+
 app.post('/telegram', async (req, res) => {
   res.sendStatus(200);
   let chatId = null;
@@ -991,6 +1006,53 @@ app.post('/telegram', async (req, res) => {
 
     // Gestione TESTO
     if (update.message.text) {
+      const textNorm = update.message.text.trim().toLowerCase();
+      const isListaReminder = /^(lista reminder|mostra reminder|reminder)$/.test(textNorm);
+
+      if (isListaReminder) {
+        console.log(`[lista-reminder] richiesta da ${userId}`);
+        const pendingRes = await pool.query(
+          `SELECT id, message, remind_at, recurrence, created_at
+             FROM reminders
+            WHERE user_id=$1 AND channel='telegram' AND done=FALSE
+            ORDER BY remind_at ASC`,
+          [userId]
+        );
+        const doneRes = await pool.query(
+          `SELECT id, message, remind_at, recurrence, created_at
+             FROM reminders
+            WHERE user_id=$1 AND channel='telegram' AND done=TRUE
+            ORDER BY remind_at DESC
+            LIMIT 10`,
+          [userId]
+        );
+
+        let lines = [];
+
+        if (pendingRes.rows.length === 0) {
+          lines.push('📌 Nessun reminder in attesa.');
+        } else {
+          lines.push(`📌 Reminder in attesa (${pendingRes.rows.length}):`);
+          for (const r of pendingRes.rows) {
+            lines.push(`- [${fmtReminderTime(r.remind_at)}] ${r.message}`);
+          }
+        }
+
+        lines.push('');
+
+        if (doneRes.rows.length === 0) {
+          lines.push('✅ Nessun reminder eseguito.');
+        } else {
+          lines.push(`✅ Ultimi eseguiti (max 10):`);
+          for (const r of doneRes.rows) {
+            lines.push(`- [${fmtReminderDateTime(r.remind_at)}] ${r.message}`);
+          }
+        }
+
+        await sendTelegramMessage(chatId, lines.join('\n'));
+        return;
+      }
+
       const reply = await processMessage(userId, update.message.text);
       await sendTelegramMessage(chatId, reply);
       return;
