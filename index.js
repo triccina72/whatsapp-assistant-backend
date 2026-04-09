@@ -281,6 +281,20 @@ const tools = [
         codice_tessuto: { type: 'string', description: 'Numero ordine di vendita es. OV25_00480' }
       }
     }
+  },
+  {
+    name: 'create_reminder',
+    description: 'Crea un promemoria che verrà inviato come messaggio Telegram all\'orario specificato. Usa SEMPRE questo tool quando l\'utente chiede "ricordami…", "tra X minuti…", "domani alle…" o qualsiasi richiesta di promemoria/reminder.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'Testo del promemoria da inviare (es. "Bere acqua", "Controllare forno")' },
+        remind_at: { type: 'string', description: 'Data e ora del promemoria in formato YYYY-MM-DDTHH:MM:SS (senza fuso orario, orario Europe/Rome). Obbligatorio se non si usa minutes_from_now.' },
+        minutes_from_now: { type: 'number', description: 'Alternativa a remind_at: numero di minuti da adesso. Es. 5 = tra 5 minuti. Se fornito, remind_at viene ignorato.' },
+        recurrence: { type: 'string', description: 'Ricorrenza: none (default), daily, weekly, monthly' }
+      },
+      required: ['message']
+    }
   }
 ];
 
@@ -575,6 +589,44 @@ async function executeTool(toolName, toolInput, userId) {
     return { ...results, trovati };
   }
 
+  if (toolName === 'create_reminder') {
+    if (!userId.startsWith('telegram_')) {
+      return { success: false, error: 'I reminder Telegram sono disponibili solo per utenti Telegram. Usa create_calendar_event per aggiungere un promemoria al calendario.' };
+    }
+
+    const { message, remind_at, minutes_from_now, recurrence } = toolInput;
+
+    let remindAt;
+    if (minutes_from_now != null && minutes_from_now > 0) {
+      remindAt = new Date(Date.now() + minutes_from_now * 60 * 1000);
+    } else if (remind_at) {
+      // Parse YYYY-MM-DDTHH:MM:SS as Europe/Rome local time, handling DST correctly
+      const m = remind_at.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)/);
+      if (!m) return { success: false, error: 'Formato remind_at non valido. Usa YYYY-MM-DDTHH:MM:SS' };
+      const localStr = m[1].length === 16 ? m[1] + ':00' : m[1]; // normalize to HH:MM:SS
+      // Try CET (UTC+1) and CEST (UTC+2): pick the offset that round-trips correctly
+      const tryOffset = (offsetStr) => {
+        const d = new Date(localStr + offsetStr);
+        const roundTrip = d.toLocaleString('sv-SE', { timeZone: 'Europe/Rome' })
+          .replace(' ', 'T').substring(0, 19);
+        return roundTrip === localStr ? d : null;
+      };
+      remindAt = tryOffset('+01:00') || tryOffset('+02:00') || new Date(localStr + '+01:00');
+    } else {
+      return { success: false, error: 'Devi fornire remind_at (es. 2026-04-09T15:30:00) oppure minutes_from_now (es. 5)' };
+    }
+
+    const rec = recurrence || 'none';
+    await pool.query(
+      'INSERT INTO reminders (user_id, conversation_id, message, remind_at, channel, recurrence) VALUES ($1,$2,$3,$4,$5,$6)',
+      [userId, userId, message, remindAt.toISOString(), 'telegram', rec]
+    );
+
+    const reminderTime = remindAt.toLocaleString('it-IT', { timeZone: 'Europe/Rome' });
+    console.log(`[Reminder] Salvato per ${userId}: "${message}" alle ${reminderTime} (ricorrenza: ${rec})`);
+    return { success: true, message, remind_at: reminderTime, recurrence: rec };
+  }
+
   return { error: 'Tool non trovato' };
 }
 
@@ -771,7 +823,7 @@ async function checkAndSendReminders() {
         );
       }
 
-      console.log(`Reminder inviato a ${chatId}: ${reminder.message}`);
+      console.log(`[Reminder] Inviato a ${chatId}: "${reminder.message}" (id: ${reminder.id})`);
     }
   } catch(err) {
     console.error('Errore checkReminders:', err.message);
@@ -856,7 +908,15 @@ ORDINI TESSUTI FORNITORE (da Gmail):
 
 CALENDARIO:
 - Formato: 2026-04-05T15:30:00 SENZA fuso orario
-- NON aggiungere offset di fuso orario`;
+- NON aggiungere offset di fuso orario
+
+REMINDER TELEGRAM:
+- Se l'utente dice "ricordami…", "tra X minuti…", "domani alle…", "avvisami…" o simili → chiama SUBITO create_reminder.
+- NON dire mai "Fatto", "Impostato", "Ricorderò" o simili se NON hai chiamato create_reminder e ricevuto success:true.
+- Se create_reminder restituisce success:true → conferma con: "✅ Reminder impostato per [orario]! Ti mando un messaggio su Telegram quando è ora."
+- Se create_reminder restituisce un errore → comunicalo chiaramente a Simona.
+- Per date/ore usa sempre il formato YYYY-MM-DDTHH:MM:SS (Europe/Rome, senza offset).
+- Se l'utente dice "tra X minuti" usa minutes_from_now=X invece di remind_at.`;
 
     let response = await anthropic.messages.create({
       model: MODEL_FAST,
