@@ -327,7 +327,7 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'create_calendar_event') {
-    const auth = getGmailAuth();
+    const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const dt = toolInput.date_time.replace(/[+Z].*$/, '');
     const durationMs = (toolInput.duration_minutes || 60) * 60000;
@@ -342,7 +342,7 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'delete_calendar_event') {
-    const auth = getGmailAuth();
+    const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const timeMin = toolInput.date ? new Date(toolInput.date+'T00:00:00').toISOString() : new Date().toISOString();
     const timeMax = toolInput.date ? new Date(toolInput.date+'T23:59:59').toISOString() : new Date(Date.now()+30*24*60*60*1000).toISOString();
@@ -354,7 +354,7 @@ async function executeTool(toolName, toolInput, userId) {
   }
 
   if (toolName === 'list_calendar_events') {
-    const auth = getGmailAuth();
+    const auth = getGoogleAuth();
     const calendar = google.calendar({ version: 'v3', auth });
     const events = await calendar.events.list({
       calendarId: process.env.GOOGLE_CALENDAR_ID||'primary',
