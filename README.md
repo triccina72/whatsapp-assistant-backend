@@ -39,7 +39,54 @@ I reminder vengono salvati nella tabella Postgres `reminders` e inviati come mes
 | `message` | string | ✅ | Testo del promemoria |
 | `remind_at` | string | ✅ (o `minutes_from_now`) | Data/ora ISO: `YYYY-MM-DDTHH:MM:SS` (Europe/Rome) |
 | `minutes_from_now` | number | ✅ (o `remind_at`) | Minuti da adesso (alternativa a `remind_at`) |
-| `recurrence` | string | ❌ | `none` (default), `daily`, `weekly`, `monthly` |
+| `recurrence` | string | ❌ | `none` (default), `daily`, `weekly`, `monthly`, `every_Xm` |
+
+## Goal Mode (Telegram)
+
+Il **Goal mode** permette di creare reminder *goal-oriented* con linguaggio naturale, senza dover usare comandi precisi.
+
+### Tipi di goal
+
+| Tipo | Descrizione | Esempio di frase |
+|------|-------------|-----------------|
+| `until_done` | Ripete il reminder a intervallo fisso finché l'utente dice "fatto" | *"Ricordami di bere finché non lo faccio"* |
+| `daily_habit` | Reminder giornaliero a orario fisso; "fatto" riconosce il completamento del giorno senza spegnere la ricorrenza | *"Voglio bere 2L al giorno, ricordami"* |
+| `interval` | Ripete ogni X minuti/ore (senza stop automatico) | *"Ricordami ogni 30 minuti di fare stretching"* |
+| `one_time` | Reminder singolo (comportamento classico) | *"Ricordami tra 10 minuti di chiamare il medico"* |
+
+### Come funziona il Goal mode
+
+1. L'utente scrive una frase naturale in italiano contenente parole chiave (`ricordami`, `ogni giorno`, `finché non lo faccio`, ecc.)
+2. Il bot intercetta l'intento **prima** di passare al LLM principale
+3. Fa **una sola chiamata LLM leggera** (haiku) per estrarre i parametri (messaggio, tipo, intervallo, orario)
+4. Se un parametro è mancante (es. intervallo per `until_done`, orario per `daily_habit`), fa **una sola domanda di chiarimento**
+5. Alla risposta successiva, crea il goal in DB e conferma con messaggio amichevole
+6. **Mai** conferma un goal se non è stato salvato in DB (`success: true` obbligatorio)
+
+### Comportamento "fatto"
+
+- **`until_done`**: il reminder viene marcato `done=TRUE` → spento per sempre. Messaggio: *"Goal completato! — spengo i reminder."*
+- **`daily_habit`**: il reminder NON viene spento, viene solo riconosciuto per oggi. Messaggio: *"Segnato per oggi. Ti ricordo di nuovo domani alle HH:MM 🌅"*
+- **Ricorrente normale**: come before, marcato `done=TRUE` per tutte le occorrenze con quel messaggio.
+
+### Persistenza dello stato
+
+Lo stato di conversazione (la "domanda di chiarimento" pendente) è salvato nella tabella `goal_sessions` con TTL di 30 minuti. Sopravvive ai riavvii del server.
+
+### Schema DB aggiuntivo
+
+```sql
+-- Colonna aggiunta a reminders:
+goal_type TEXT DEFAULT NULL  -- 'until_done' | 'daily_habit' | NULL
+
+-- Nuova tabella per sessioni goal pendenti:
+CREATE TABLE goal_sessions (
+  user_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,        -- 'awaiting_interval' | 'awaiting_time'
+  goal_data JSONB NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
 
 ### Variabili d'ambiente richieste
 - `DATABASE_URL` — URL Postgres (Railway lo imposta automaticamente)

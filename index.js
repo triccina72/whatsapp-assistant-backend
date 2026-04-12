@@ -25,6 +25,316 @@ const pendingImages = new Map();
 // Traccia l'ultimo reminder ricorrente inviato per utente (in memoria)
 const lastSentByUser = new Map(); // userId -> { id, message }
 
+// ─── GOAL SESSIONS (DB-backed state machine) ─────────────────
+
+// Recupera la sessione goal pendente per un utente (scaduta dopo 30 min)
+async function getPendingGoalSession(userId) {
+  const r = await pool.query(
+    `SELECT state, goal_data FROM goal_sessions
+     WHERE user_id=$1 AND created_at > NOW() - INTERVAL '30 minutes'`,
+    [userId]
+  );
+  if (!r.rows[0]) {
+    // Pulisci sessioni scadute
+    await pool.query('DELETE FROM goal_sessions WHERE user_id=$1', [userId]);
+    return null;
+  }
+  return r.rows[0];
+}
+
+async function setPendingGoalSession(userId, state, goalData) {
+  await pool.query(
+    `INSERT INTO goal_sessions (user_id, state, goal_data) VALUES ($1,$2,$3)
+     ON CONFLICT (user_id) DO UPDATE SET state=$2, goal_data=$3, created_at=NOW()`,
+    [userId, state, JSON.stringify(goalData)]
+  );
+}
+
+async function clearGoalSession(userId) {
+  await pool.query('DELETE FROM goal_sessions WHERE user_id=$1', [userId]);
+}
+
+// ─── GOAL INTENT DETECTION ───────────────────────────────────
+
+// Rileva se il messaggio contiene un intento di creare un reminder/goal
+function isGoalOrReminderIntent(text) {
+  const t = text.toLowerCase();
+  // Parole chiave esplicite per reminder
+  if (/\b(ricordami|ricorda(?:ti)?|reminder|promemoria|avvisami)\b/.test(t)) return true;
+  // Indicatori di goal/abitudine
+  if (/\b(finché|fintanto\s+che|ogni\s+giorno|tutti\s+i\s+giorni|ogni\s+settimana|ogni\s+mese)\b/.test(t)) return true;
+  // Indicatori di intervallo
+  if (/\bogni\s+(\d+\s*)?(minuti?|ore?|ora)\b/.test(t)) return true;
+  return false;
+}
+
+// ─── GOAL PARAMETER EXTRACTION (singola chiamata LLM leggera) ─
+
+async function extractGoalParams(text) {
+  const nowStr = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' });
+  const systemPrompt = `Estrai i parametri di un reminder o goal da testo italiano. Rispondi SOLO con JSON valido, nessun altro testo.
+{
+  "message": "cosa fare (stringa breve, es: 'bere', 'prendere le medicine')",
+  "goal_type": "until_done|daily_habit|interval|one_time",
+  "interval_minutes": null oppure numero (es. 30 per ogni 30 min, 60 per ogni ora),
+  "daily_time": null oppure "HH:MM" (es. "09:00"),
+  "minutes_from_now": null oppure numero,
+  "remind_at": null oppure "YYYY-MM-DDTHH:MM:SS"
+}
+Regole goal_type:
+- "until_done": reminder ripetuti finché non dice "fatto" ("finché non lo faccio", "finché non te lo dico", "fino a quando non rispondo fatto", "ripeti finché")
+- "daily_habit": ogni giorno o tutti i giorni ("ogni giorno", "tutti i giorni", "abitudine", "giornalmente")
+- "interval": ogni X minuti/ore ("ogni 30 minuti", "ogni ora", "ogni 2 ore")
+- "one_time": una sola volta ("tra 5 minuti", "domani alle 9", "lunedì alle 10")
+Data/ora attuale: ${nowStr}`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: MODEL_FAST,
+      max_tokens: 256,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: text }]
+    });
+    const raw = response.content[0].text.trim().replace(/```json\n?|\n?```/g, '');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('[Goal] Errore estrazione parametri:', e.message);
+    return null;
+  }
+}
+
+// Numero massimo di minuti per un intervallo goal (1 giorno)
+const MAX_INTERVAL_MINUTES = 1440;
+
+// ─── INTERVAL AND TIME PARSERS ───────────────────────────────
+
+// Restituisce il numero di minuti da una frase italiana di intervallo
+function parseIntervalMinutes(text) {
+  const t = text.toLowerCase().trim();
+  // Usa \b per ancorare i numeri ed evitare backtracking su sequenze ripetitive
+  const mMin = t.match(/\b(\d{1,4})\s*min(?:uti?)?/);
+  if (mMin) return parseInt(mMin[1]);
+  const mHours = t.match(/\b(\d{1,3})\s*or[ae]/);
+  if (mHours) return parseInt(mHours[1]) * 60;
+  if (/\bogni\s+ora\b|^un['']?\s*ora$|^1\s*h$/.test(t)) return 60;
+  const mH = t.match(/\b(\d{1,3})\s*h\b/);
+  if (mH) return parseInt(mH[1]) * 60;
+  const mNumOnly = t.match(/^(\d{1,4})$/);
+  if (mNumOnly) return parseInt(mNumOnly[1]);
+  return null;
+}
+
+// Restituisce "HH:MM" da una frase italiana di orario
+function parseTimeHHMM(text) {
+  const t = text.toLowerCase().trim();
+  const m1 = t.match(/(?:alle?\s*)?(\d{1,2})[:.](\d{2})/);
+  if (m1) return `${m1[1].padStart(2, '0')}:${m1[2]}`;
+  const m2 = t.match(/(?:alle?\s*)(\d{1,2})(?:\s|$)/);
+  if (m2) return `${m2[1].padStart(2, '0')}:00`;
+  return null;
+}
+
+// ─── GOAL REMINDER CREATION ───────────────────────────────────
+
+// Calcola remindAt e recurrence dai parametri del goal
+function buildReminderTime(goalData) {
+  const { goal_type, interval_minutes, daily_time, minutes_from_now, remind_at } = goalData;
+
+  if (goal_type === 'until_done' || goal_type === 'interval') {
+    const intervalMin = interval_minutes || 60;
+    return {
+      remindAt: new Date(Date.now() + intervalMin * 60 * 1000),
+      recurrence: `every_${intervalMin}m`
+    };
+  }
+
+  if (goal_type === 'daily_habit') {
+    let remindAt;
+    if (daily_time) {
+      const [h, m] = daily_time.split(':').map(Number);
+      // Calcola l'orario nel fuso Europe/Rome
+      const nowRome = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+      const candidate = new Date(nowRome);
+      candidate.setHours(h, m, 0, 0);
+      // Se già passato oggi, programma per domani
+      if (candidate <= nowRome) candidate.setDate(candidate.getDate() + 1);
+      remindAt = candidate;
+    } else {
+      remindAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    }
+    return { remindAt, recurrence: 'daily' };
+  }
+
+  // one_time
+  if (minutes_from_now) {
+    return {
+      remindAt: new Date(Date.now() + minutes_from_now * 60 * 1000),
+      recurrence: 'none'
+    };
+  }
+  if (remind_at) {
+    const mStr = remind_at.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)/);
+    if (mStr) {
+      const localStr = mStr[1].length === 16 ? mStr[1] + ':00' : mStr[1];
+      const tryOffset = (off) => {
+        const d = new Date(localStr + off);
+        const rt = d.toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T').substring(0, 19);
+        return rt === localStr ? d : null;
+      };
+      return {
+        remindAt: tryOffset('+01:00') || tryOffset('+02:00') || new Date(localStr + '+01:00'),
+        recurrence: 'none'
+      };
+    }
+  }
+  return null;
+}
+
+async function createGoalReminder(userId, goalData) {
+  const timing = buildReminderTime(goalData);
+  if (!timing) return null;
+  const { remindAt, recurrence } = timing;
+  const dbGoalType = (goalData.goal_type === 'until_done' || goalData.goal_type === 'daily_habit')
+    ? goalData.goal_type : null;
+
+  await pool.query(
+    'INSERT INTO reminders (user_id, conversation_id, message, remind_at, channel, recurrence, goal_type) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [userId, userId, goalData.message, remindAt.toISOString(), 'telegram', recurrence, dbGoalType]
+  );
+
+  console.log(`[Goal] Creato per ${userId}: "${goalData.message}" (${goalData.goal_type}, ${recurrence})`);
+  return { remindAt, recurrence, goal_type: dbGoalType };
+}
+
+// ─── GOAL CONFIRMATION ───────────────────────────────────────
+
+async function sendGoalConfirmation(chatId, message, goal_type, result) {
+  const { remindAt, recurrence } = result;
+  const timeStr = remindAt.toLocaleString('it-IT', { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit' });
+
+  let text;
+  if (goal_type === 'until_done') {
+    const minMatch = recurrence.match(/^every_(\d+)m$/);
+    const min = minMatch ? parseInt(minMatch[1]) : 60;
+    const freqStr = min < 60 ? `ogni ${min} minuti` : min === 60 ? 'ogni ora' : `ogni ${min / 60} ore`;
+    text = `Goal attivato! Ti ricordo di "${message}" ${freqStr}.\nQuando lo fai, scrivimi "fatto" e smetto! 💪`;
+  } else if (goal_type === 'daily_habit') {
+    text = `Abitudine giornaliera impostata! Ogni giorno alle ${timeStr} ti ricordo di "${message}".\nScrivi "fatto" quando l'hai fatto! 🌅`;
+  } else {
+    text = `Reminder impostato per le ${timeStr}! Ti mando un messaggio quando e' ora. ⏰`;
+  }
+
+  await sendTelegramMessage(chatId, text);
+}
+
+// ─── GOAL INTENT HANDLER ─────────────────────────────────────
+
+async function handleGoalIntent(userId, chatId, text) {
+  console.log(`[Goal] Intento rilevato da ${userId}: "${text}"`);
+
+  const params = await extractGoalParams(text);
+  if (!params || !params.message) {
+    // Fallback: lascia gestire al LLM
+    const reply = await processMessage(userId, text);
+    await sendTelegramMessage(chatId, reply);
+    return;
+  }
+
+  const { message, goal_type } = params;
+
+  // Manca l'intervallo per "until_done"?
+  if (goal_type === 'until_done' && !params.interval_minutes) {
+    await setPendingGoalSession(userId, 'awaiting_interval', params);
+    await sendTelegramMessage(chatId,
+      `Perfetto! Vuoi che ti ricordi di "${message}" finche' non lo fai.\nOgni quanto? (es: ogni 30 minuti, ogni ora, ogni 2 ore)`
+    );
+    return;
+  }
+
+  // Manca l'orario per "daily_habit"?
+  if (goal_type === 'daily_habit' && !params.daily_time) {
+    await setPendingGoalSession(userId, 'awaiting_time', params);
+    await sendTelegramMessage(chatId,
+      `Abitudine giornaliera: "${message}"! A che ora vuoi il reminder ogni giorno? (es: alle 9, alle 10:30)`
+    );
+    return;
+  }
+
+  // Per "one_time" senza orario: fallback al LLM (gestione complessa)
+  if (goal_type === 'one_time' && !params.minutes_from_now && !params.remind_at) {
+    const reply = await processMessage(userId, text);
+    await sendTelegramMessage(chatId, reply);
+    return;
+  }
+
+  // Tutti i parametri presenti: crea subito
+  const result = await createGoalReminder(userId, params);
+  if (!result) {
+    await sendTelegramMessage(chatId, 'Non riesco a impostare il reminder. Puoi dirmi quando? (es: tra 30 minuti, domani alle 9)');
+    return;
+  }
+
+  await sendGoalConfirmation(chatId, message, goal_type, result);
+}
+
+// ─── GOAL SESSION REPLY HANDLER ───────────────────────────────
+
+async function handleGoalSessionReply(userId, chatId, text, session) {
+  const state = session.state;
+  const goalData = typeof session.goal_data === 'string'
+    ? JSON.parse(session.goal_data) : session.goal_data;
+
+  // Annullamento esplicito
+  if (/\b(annulla|cancel|basta|lascia\s+perdere)\b/i.test(text)) {
+    await clearGoalSession(userId);
+    await sendTelegramMessage(chatId, 'Ok, nessun problema! Goal annullato. 👍');
+    return;
+  }
+
+  if (state === 'awaiting_interval') {
+    const intervalMin = parseIntervalMinutes(text);
+    if (!intervalMin || intervalMin < 1 || intervalMin > MAX_INTERVAL_MINUTES) {
+      await sendTelegramMessage(chatId,
+        'Non ho capito l\'intervallo. Prova con: "ogni 30 minuti", "ogni ora", "ogni 2 ore"'
+      );
+      return;
+    }
+    goalData.interval_minutes = intervalMin;
+    await clearGoalSession(userId);
+    const result = await createGoalReminder(userId, goalData);
+    if (!result) {
+      await sendTelegramMessage(chatId, 'Errore nella creazione del goal. Riprova!');
+      return;
+    }
+    await sendGoalConfirmation(chatId, goalData.message, goalData.goal_type, result);
+    return;
+  }
+
+  if (state === 'awaiting_time') {
+    const time = parseTimeHHMM(text);
+    if (!time) {
+      await sendTelegramMessage(chatId,
+        'Non ho capito l\'orario. Prova con: "alle 9", "alle 10:30", "alle 18:00"'
+      );
+      return;
+    }
+    goalData.daily_time = time;
+    await clearGoalSession(userId);
+    const result = await createGoalReminder(userId, goalData);
+    if (!result) {
+      await sendTelegramMessage(chatId, 'Errore nella creazione del goal. Riprova!');
+      return;
+    }
+    await sendGoalConfirmation(chatId, goalData.message, goalData.goal_type, result);
+    return;
+  }
+
+  // Stato sconosciuto: pulisci e processa normalmente
+  await clearGoalSession(userId);
+  const reply = await processMessage(userId, text);
+  await sendTelegramMessage(chatId, reply);
+}
+
 function getGoogleAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   return new google.auth.JWT(
@@ -126,6 +436,18 @@ async function initDB() {
     key TEXT PRIMARY KEY,
     value TEXT,
     updated_at TIMESTAMP DEFAULT NOW()
+  )`);
+
+  // Migrazione: aggiungi goal_type alla tabella reminders (se non esiste già)
+  await pool.query(`ALTER TABLE reminders ADD COLUMN IF NOT EXISTS goal_type TEXT DEFAULT NULL`)
+    .catch(err => console.log('[DB] goal_type column migration:', err.message));
+
+  // Tabella sessioni goal (stato macchina per creazione goal multi-turno)
+  await pool.query(`CREATE TABLE IF NOT EXISTS goal_sessions (
+    user_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    goal_data JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
   )`);
 
   console.log('Database pronto.');
@@ -819,9 +1141,14 @@ async function checkAndSendReminders() {
         lastSentByUser.set(reminder.user_id, { id: reminder.id, message: reminder.message });
         // Calcola prossima scadenza
         let nextDate = new Date(reminder.remind_at);
-        if (reminder.recurrence === 'daily')   nextDate.setDate(nextDate.getDate() + 1);
-        if (reminder.recurrence === 'weekly')  nextDate.setDate(nextDate.getDate() + 7);
-        if (reminder.recurrence === 'monthly') nextDate.setMonth(nextDate.getMonth() + 1);
+        if (reminder.recurrence === 'daily')        nextDate.setDate(nextDate.getDate() + 1);
+        else if (reminder.recurrence === 'weekly')  nextDate.setDate(nextDate.getDate() + 7);
+        else if (reminder.recurrence === 'monthly') nextDate.setMonth(nextDate.getMonth() + 1);
+        else {
+          // every_Xm: ogni X minuti (es. every_30m, every_60m)
+          const everyMin = reminder.recurrence.match(/^every_(\d+)m$/);
+          if (everyMin) nextDate = new Date(Date.now() + parseInt(everyMin[1]) * 60 * 1000);
+        }
         await pool.query(
           'UPDATE reminders SET remind_at=$1 WHERE id=$2',
           [nextDate.toISOString(), reminder.id]
@@ -861,11 +1188,29 @@ function formatReminderTime(date) {
 
 const RECURRENCE_IT = { daily: 'ogni giorno', weekly: 'ogni settimana', monthly: 'ogni mese' };
 
+function formatRecurrenceLabel(recurrence, goal_type) {
+  if (!recurrence || recurrence === 'none') return '';
+  let recLabel;
+  if (RECURRENCE_IT[recurrence]) {
+    recLabel = RECURRENCE_IT[recurrence];
+  } else {
+    const everyMin = recurrence.match(/^every_(\d+)m$/);
+    if (everyMin) {
+      const min = parseInt(everyMin[1]);
+      recLabel = min < 60 ? `ogni ${min} min` : min === 60 ? 'ogni ora' : `ogni ${min / 60}h`;
+    } else {
+      recLabel = recurrence;
+    }
+  }
+  const goalSuffix = goal_type === 'until_done' ? ' 🎯' : goal_type === 'daily_habit' ? ' 🌅' : '';
+  return ` ♻️ ${recLabel}${goalSuffix}`;
+}
+
 async function handleListaReminder(userId, chatId) {
   console.log(`[lista-reminder] richiesta da ${userId}`);
   const [pendingResult, doneResult] = await Promise.all([
     pool.query(
-      `SELECT message, remind_at, recurrence FROM reminders
+      `SELECT message, remind_at, recurrence, goal_type FROM reminders
        WHERE user_id=$1 AND done=FALSE
        ORDER BY remind_at ASC`,
       [userId]
@@ -889,7 +1234,7 @@ async function handleListaReminder(userId, chatId) {
     lines.push(`📌 In attesa (${pending.length}):`);
     for (const r of pending) {
       const recLabel = r.recurrence && r.recurrence !== 'none'
-        ? ` ♻️ ${RECURRENCE_IT[r.recurrence] || r.recurrence}`
+        ? formatRecurrenceLabel(r.recurrence, r.goal_type)
         : '';
       lines.push(`• ${r.message} — ${formatReminderTime(r.remind_at)}${recLabel}`);
     }
@@ -1144,19 +1489,49 @@ app.post('/telegram', async (req, res) => {
 
       // Rileva intento di completamento ("fatto", "ho fatto", ecc.)
       const { isCompletion, subject } = detectCompletionIntent(text);
+
+      // Sessione goal pendente (solo se non è un "fatto" — il "fatto" ha priorità)
+      if (!isCompletion) {
+        const pendingSession = await getPendingGoalSession(userId);
+        if (pendingSession) {
+          await handleGoalSessionReply(userId, chatId, text, pendingSession);
+          return;
+        }
+      } else {
+        // Se l'utente dice "fatto" mentre c'è una sessione pendente, annullala
+        await clearGoalSession(userId);
+      }
+
       if (isCompletion) {
         const { reminder, ambiguous, openGoals } = await findGoalReminder(userId, subject);
 
         if (reminder) {
-          // Chiudi tutti i reminder ricorrenti con lo stesso messaggio/obiettivo per questo utente
-          await pool.query(
-            `UPDATE reminders SET done=TRUE
-             WHERE user_id=$1 AND channel='telegram' AND LOWER(message)=LOWER($2)
-               AND done=FALSE AND recurrence IS NOT NULL AND recurrence != 'none'`,
-            [userId, reminder.message]
-          );
-          lastSentByUser.delete(userId);
-          await sendTelegramMessage(chatId, `Perfetto ✅ Segno come fatto: "${reminder.message}"`);
+          if (reminder.goal_type === 'daily_habit') {
+            // Abitudine giornaliera: riconosce "fatto" per oggi, ma NON spegne la ricorrenza
+            const nextTime = new Date(reminder.remind_at);
+            const timeStr = nextTime.toLocaleString('it-IT', {
+              timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit'
+            });
+            lastSentByUser.delete(userId);
+            await sendTelegramMessage(chatId, `Brava! Segnato per oggi. Ti ricordo di nuovo domani alle ${timeStr} 🌅`);
+          } else {
+            // until_done o ricorrente normale: spegni definitivamente
+            if (reminder.goal_type === 'until_done') {
+              await pool.query('UPDATE reminders SET done=TRUE WHERE id=$1', [reminder.id]);
+            } else {
+              await pool.query(
+                `UPDATE reminders SET done=TRUE
+                 WHERE user_id=$1 AND channel='telegram' AND LOWER(message)=LOWER($2)
+                   AND done=FALSE AND recurrence IS NOT NULL AND recurrence != 'none'`,
+                [userId, reminder.message]
+              );
+            }
+            lastSentByUser.delete(userId);
+            const doneMsg = reminder.goal_type === 'until_done'
+              ? `Goal completato! "${reminder.message}" — spengo i reminder. Brava! 💪`
+              : `Perfetto ✅ Segno come fatto: "${reminder.message}"`;
+            await sendTelegramMessage(chatId, doneMsg);
+          }
           return;
         }
 
@@ -1165,6 +1540,12 @@ app.post('/telegram', async (req, res) => {
           await sendTelegramMessage(chatId, `Ok—quale intendi? 🤔\n${list}`);
           return;
         }
+      }
+
+      // Intercetta intento goal/reminder prima del LLM
+      if (isGoalOrReminderIntent(text)) {
+        await handleGoalIntent(userId, chatId, text);
+        return;
       }
 
       const reply = await processMessage(userId, text);
